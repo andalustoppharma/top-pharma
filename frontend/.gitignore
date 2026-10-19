@@ -1,0 +1,57 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Build
+dist/
+dist-ssr/
+build/
+*.local
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Logs
+logs/
+*.log
+
+# Editor
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Vite ⚠️
+.vite/
+vite.config.js.timestamp-*
+vite.config.ts.timestamp-*
+*.timestamp-*.mjs
+
+# PWA
+sw.js
+workbox-*.js
+dev-dist/
+
+# Testing
+coverage/
+.nyc_output/
+
+# Cache
+.eslintcache
+.stylelintcache
+
+# Vercel
+.vercel/
+
+# Temp
+*.tmp
+*.temp
+.cache/
