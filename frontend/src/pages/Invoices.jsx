@@ -99,10 +99,10 @@ function InvoicesPage() {
   const hasActiveFilters = Boolean(search || statusFilter || paymentTypeFilter);
 
   const handleCreateSuccess = () => {
-    setIsFormOpen(false);
-    toast.success('تم إنشاء الفاتورة.');
-    loadInvoices();
-  };
+  setIsFormOpen(false);
+  // ✅ Toast مُدار من InvoiceForm (نعرف نوع العملية هناك)
+  loadInvoices();
+};
 
   const columns = [
     {
