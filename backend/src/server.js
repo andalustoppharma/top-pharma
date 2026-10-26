@@ -40,6 +40,7 @@ import deliveryNoteRoutes from './routes/deliveryNoteRoutes.js';
 import customerReturnRoutes from './routes/customerReturnRoutes.js';
 import supplierReturnRoutes from './routes/supplierReturnRoutes.js';
 import purchaseReceiptRoutes from './routes/purchaseReceiptRoutes.js';
+import dashboardRoutes from './routes/dashboardRoutes.js';
 
 import { startAllJobs, stopAllJobs } from './jobs/index.js';
 import { verifyEmailConnection } from './utils/email.js';
@@ -129,6 +130,8 @@ app.use(env.API_PREFIX, (req, res, next) => {
   app.use(`${env.API_PREFIX}/supplier-returns`, supplierReturnRoutes);
   app.use(`${env.API_PREFIX}/purchase-receipts`, purchaseReceiptRoutes);
 
+  // ── Phase 4: Dashboard & Reports ──
+  app.use(`${env.API_PREFIX}/dashboard`, dashboardRoutes);
   // ── صفحة الجذر ──
   app.get('/', (_req, res) => {
     res.status(200).json({
