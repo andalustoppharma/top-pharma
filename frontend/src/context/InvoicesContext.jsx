@@ -1,9 +1,15 @@
 /**
  * @file InvoicesContext.jsx
- * @description Context الفواتير — Phase 2.5 (مسودات + تقييد سعري).
+ * @description Context الفواتير — Phase 2.5.
+ *
+ * يُصدّر:
+ *  - InvoicesContext
+ *  - InvoicesProvider
+ *  - useInvoices (✅ جديد)
+ *  - useInvoicesContext (✅ alias)
  */
 
-import { createContext, useCallback, useMemo, useState } from 'react';
+import { createContext, useCallback, useContext, useMemo, useState } from 'react';
 
 import * as invoicesAPI from '../api/invoicesAPI.js';
 
@@ -23,10 +29,6 @@ export function InvoicesProvider({ children }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [stats, setStats] = useState(INITIAL_STATS);
-
-  // ═══════════════════════════════════════════════
-  // القراءة
-  // ═══════════════════════════════════════════════
 
   const fetchInvoices = useCallback(async (params = {}) => {
     setLoading(true);
@@ -68,10 +70,6 @@ export function InvoicesProvider({ children }) {
     }
   }, []);
 
-  // ═══════════════════════════════════════════════
-  // ✅ الإنشاء — نهائية
-  // ═══════════════════════════════════════════════
-
   const createInvoice = useCallback(async (payload) => {
     setLoading(true);
     setError(null);
@@ -86,10 +84,6 @@ export function InvoicesProvider({ children }) {
       setLoading(false);
     }
   }, []);
-
-  // ═══════════════════════════════════════════════
-  // ✅ Phase 2.5 — إنشاء مسودة
-  // ═══════════════════════════════════════════════
 
   const createDraft = useCallback(async (payload) => {
     setLoading(true);
@@ -108,10 +102,6 @@ export function InvoicesProvider({ children }) {
     }
   }, []);
 
-  // ═══════════════════════════════════════════════
-  // ✅ Phase 2.5 — تعديل مسودة
-  // ═══════════════════════════════════════════════
-
   const updateDraft = useCallback(async (id, payload) => {
     setLoading(true);
     setError(null);
@@ -127,10 +117,6 @@ export function InvoicesProvider({ children }) {
       setLoading(false);
     }
   }, []);
-
-  // ═══════════════════════════════════════════════
-  // ✅ Phase 2.5 — اعتماد مسودة
-  // ═══════════════════════════════════════════════
 
   const finalize = useCallback(async (id, payload) => {
     setLoading(true);
@@ -153,10 +139,6 @@ export function InvoicesProvider({ children }) {
     }
   }, []);
 
-  // ═══════════════════════════════════════════════
-  // التعديل (نهائية)
-  // ═══════════════════════════════════════════════
-
   const updateInvoice = useCallback(async (id, payload) => {
     setLoading(true);
     setError(null);
@@ -172,10 +154,6 @@ export function InvoicesProvider({ children }) {
       setLoading(false);
     }
   }, []);
-
-  // ═══════════════════════════════════════════════
-  // الإجراءات
-  // ═══════════════════════════════════════════════
 
   const cancelInvoice = useCallback(async (id, payload) => {
     setLoading(true);
@@ -209,18 +187,14 @@ export function InvoicesProvider({ children }) {
     }
   }, []);
 
-  // ═══════════════════════════════════════════════
-  // القيمة المُصدَّرة
-  // ═══════════════════════════════════════════════
-
   const value = useMemo(
     () => ({
       invoices, pagination, loading, error, stats,
       fetchInvoices, fetchStats,
       createInvoice,
-      createDraft,      // ✅ جديد
-      updateDraft,      // ✅ جديد
-      finalize,         // ✅ جديد
+      createDraft,
+      updateDraft,
+      finalize,
       updateInvoice,
       cancelInvoice,
       registerPayment,
@@ -237,3 +211,18 @@ export function InvoicesProvider({ children }) {
     </InvoicesContext.Provider>
   );
 }
+
+/* ═══════════════════════════════════════════════════════════════
+ * Hooks
+ * ═══════════════════════════════════════════════════════════════ */
+
+export function useInvoices() {
+  const ctx = useContext(InvoicesContext);
+  if (!ctx) {
+    throw new Error('useInvoices must be used within InvoicesProvider');
+  }
+  return ctx;
+}
+
+// ✅ Alias للتوافق
+export const useInvoicesContext = useInvoices;

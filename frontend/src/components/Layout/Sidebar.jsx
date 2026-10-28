@@ -1,17 +1,10 @@
 /**
  * @file Sidebar.jsx
  * @description
- * القائمة الجانبية للتطبيق (Navigation Sidebar).
- *
- * لماذا هذا الملف؟
- * - تُوفّر التنقل بين أقسام التطبيق (Dashboard, Inventory, Sales).
- * - تطبق الصلاحيات (RBAC): كل دور يرى ما يخصه فقط.
- * - تدعم التوسيع/الطي (Collapsible groups) لتوفير المساحة.
- * - تُبرز المسار النشط (Active Link) باستخدام `NavLink`.
- * - تدعم RTL بالكامل.
+ * القائمة الجانبية للتطبيق — Phase 4 (التقارير الكاملة).
  */
 
-import { useState } from 'react';
+import { useState, useContext } from 'react';
 import { NavLink, useLocation } from 'react-router-dom';
 import {
   LayoutDashboard,
@@ -30,18 +23,23 @@ import {
   ClipboardList,
   Receipt,
   ArrowLeftRight,
+  Wallet,
+  Coins,
+  Landmark,
+  FileCheck,
+  ScrollText,
+  BarChart3,
+  TrendingUp,
 } from 'lucide-react';
 
 import { useAuth } from '../../hooks/useAuth.js';
+import ChecksContext from '../../context/ChecksContext.jsx';
 
 // ═══════════════════════════════════════════════
-// 1. مكونات فرعية للتنقل
+// مكونات فرعية
 // ═══════════════════════════════════════════════
 
-/**
- * رابط تنقل بسيط.
- */
-function SidebarLink({ to, icon: Icon, label, end = false }) {
+function SidebarLink({ to, icon: Icon, label, end = false, badge = 0 }) {
   return (
     <NavLink
       to={to}
@@ -55,15 +53,23 @@ function SidebarLink({ to, icon: Icon, label, end = false }) {
       }
     >
       {Icon && <Icon size={18} className="flex-shrink-0" />}
-      <span className="truncate">{label}</span>
+      <span className="truncate flex-1">{label}</span>
+      {badge > 0 && (
+        <span className="bg-danger-500 text-white text-[10px] font-bold rounded-full min-w-[20px] h-5 flex items-center justify-center px-1.5 flex-shrink-0">
+          {badge > 99 ? '99+' : badge}
+        </span>
+      )}
     </NavLink>
   );
 }
 
-/**
- * مجموعة تنقل قابلة للتوسيع (مثل المخزون / المبيعات).
- */
-function SidebarGroup({ title, icon: Icon, children, defaultOpen = false, isActiveGroup }) {
+function SidebarGroup({
+  title,
+  icon: Icon,
+  children,
+  defaultOpen = false,
+  isActiveGroup,
+}) {
   const [isOpen, setIsOpen] = useState(defaultOpen || isActiveGroup);
 
   return (
@@ -98,55 +104,45 @@ function SidebarGroup({ title, icon: Icon, children, defaultOpen = false, isActi
 }
 
 // ═══════════════════════════════════════════════
-// 2. المكون الرئيسي
+// المكون الرئيسي
 // ═══════════════════════════════════════════════
 
-/**
- * القائمة الجانبية الرئيسية.
- * @returns {JSX.Element}
- */
 function Sidebar() {
-  const { userRole, isAdmin, isStorekeeper, isAccountant, isSalesRep, isPharmacy } = useAuth();
+  const {
+    userRole,
+    isAdmin,
+    isStorekeeper,
+    isAccountant,
+    isSalesRep,
+    isPharmacy,
+  } = useAuth();
   const location = useLocation();
 
-  // ─────────────────────────────────────────────
-  // تحديد الصلاحيات لعرض الأقسام
-  // ─────────────────────────────────────────────
-  
-  // لوحة التحكم: للجميع
+  const checksCtx = useContext(ChecksContext);
+  const pendingChecksCount = checksCtx
+    ? (checksCtx.overdue?.length || 0) + (checksCtx.upcoming?.length || 0)
+    : 0;
+
   const canViewDashboard = true;
-
-  // المخزون: للمدير، أمين المخزن، المحاسب (وليس للمندوب أو الصيدلية)
   const canViewInventory = isAdmin || isStorekeeper || isAccountant;
-
-  // المبيعات: للمدير، المحاسب، المندوب
   const canViewSales = isAdmin || isAccountant || isSalesRep;
-
-  // المشتريات ومرتجعات الموردين: للمدير، أمين المخزن، المحاسب
   const canViewPurchases = isAdmin || isStorekeeper || isAccountant;
-
-  // صيدلياتي (خاص بالمندوب): عرض فقط للصيدليات
+  const canViewFinance = isAdmin || isAccountant;
+  const canViewReports = isAdmin || isAccountant;
   const canViewMyPharmacies = isSalesRep;
-
-  // فواتيري (خاص بالصيدلية)
   const canViewMyInvoices = isPharmacy;
 
   return (
     <aside className="w-64 bg-white border-l border-neutral-200 h-screen flex flex-col sticky top-0">
-      {/* ─── الترويسة (Logo) ─── */}
       <div className="h-16 flex items-center justify-center border-b border-neutral-200 flex-shrink-0">
         <h1 className="text-xl font-bold text-primary-800">TOP PHARMA</h1>
       </div>
 
-      {/* ─── القائمة (Scrollable) ─── */}
       <nav className="flex-1 overflow-y-auto p-4 space-y-1 scrollbar-thin">
-        
-        {/* 1. لوحة التحكم */}
         {canViewDashboard && (
           <SidebarLink to="/" icon={LayoutDashboard} label="لوحة التحكم" end />
         )}
 
-        {/* 2. المخزون (Phase 1) */}
         {canViewInventory && (
           <SidebarGroup
             title="المخزون"
@@ -162,12 +158,15 @@ function Sidebar() {
           </SidebarGroup>
         )}
 
-        {/* 3. المبيعات (Phase 2) */}
         {canViewSales && (
           <SidebarGroup
             title="المبيعات"
             icon={ShoppingCart}
-            isActiveGroup={location.pathname.startsWith('/sales') && !location.pathname.includes('purchase') && !location.pathname.includes('supplier-returns')}
+            isActiveGroup={
+              location.pathname.startsWith('/sales') &&
+              !location.pathname.includes('purchase') &&
+              !location.pathname.includes('supplier-returns')
+            }
           >
             <SidebarLink to="/sales/invoices" icon={FileText} label="الفواتير" />
             <SidebarLink to="/sales/delivery-notes" icon={Truck} label="إيصالات التسليم" />
@@ -175,32 +174,78 @@ function Sidebar() {
           </SidebarGroup>
         )}
 
-        {/* 4. المشتريات ومرتجعات الموردين */}
         {canViewPurchases && (
           <SidebarGroup
             title="المشتريات"
             icon={Receipt}
-            isActiveGroup={location.pathname.includes('purchase-receipts') || location.pathname.includes('supplier-returns')}
+            isActiveGroup={
+              location.pathname.includes('purchase-receipts') ||
+              location.pathname.includes('supplier-returns')
+            }
           >
             <SidebarLink to="/sales/purchase-receipts" icon={Receipt} label="إيصالات الاستلام" />
             <SidebarLink to="/sales/supplier-returns" icon={ArrowLeftRight} label="مرتجعات الموردين" />
           </SidebarGroup>
         )}
 
-        {/* 5. صيدلياتي (خاص بالمندوب) */}
+        {canViewFinance && (
+          <SidebarGroup
+            title="المالية"
+            icon={Wallet}
+            isActiveGroup={location.pathname.startsWith('/finance')}
+          >
+            <SidebarLink to="/finance" icon={Wallet} label="نظرة عامة" end />
+            <SidebarLink to="/finance/cash-funds" icon={Coins} label="الصناديق النقدية" />
+            <SidebarLink to="/finance/bank-accounts" icon={Landmark} label="الحساب البنكي" />
+            <SidebarLink
+              to="/finance/checks"
+              icon={FileCheck}
+              label="الشيكات"
+              badge={pendingChecksCount}
+            />
+            <SidebarLink to="/finance/cash-transactions" icon={Receipt} label="الحركات النقدية" />
+            <SidebarLink to="/finance/accounting-entries" icon={ScrollText} label="القيود المحاسبية" />
+          </SidebarGroup>
+        )}
+
+        {canViewReports && (
+          <SidebarGroup
+            title="التقارير"
+            icon={BarChart3}
+            isActiveGroup={location.pathname.startsWith('/reports')}
+          >
+            <SidebarLink to="/reports" icon={BarChart3} label="مركز التقارير" end />
+            <SidebarLink to="/reports/finance" icon={Wallet} label="التقارير المالية" />
+            <SidebarLink to="/reports/sales" icon={TrendingUp} label="تقارير المبيعات" />
+            <SidebarLink to="/reports/customers" icon={Users} label="تقارير العملاء" />
+            <SidebarLink to="/reports/suppliers" icon={Truck} label="تقارير الموردين" />
+            <SidebarLink to="/reports/inventory" icon={Package} label="تقارير المخزون" />
+          </SidebarGroup>
+        )}
+
         {canViewMyPharmacies && (
           <SidebarLink to="/inventory/customers" icon={Store} label="صيدلياتي" />
         )}
 
-        {/* 6. فواتيري (خاص بالصيدلية) */}
         {canViewMyInvoices && (
           <SidebarLink to="/sales/invoices" icon={FileText} label="فواتيري" />
         )}
       </nav>
 
-      {/* ─── الفوتر (بيانات المستخدم) ─── */}
       <div className="p-4 border-t border-neutral-200 flex-shrink-0 text-sm text-neutral-600">
-        <p className="font-bold text-neutral-900">{userRole === 'sales_rep' ? 'المندوب' : userRole === 'pharmacy' ? 'الصيدلية' : 'المستخدم'}</p>
+        <p className="font-bold text-neutral-900">
+          {userRole === 'sales_rep'
+            ? 'المندوب'
+            : userRole === 'pharmacy'
+              ? 'الصيدلية'
+              : userRole === 'accountant'
+                ? 'المحاسب'
+                : userRole === 'storekeeper'
+                  ? 'أمين المخزن'
+                  : userRole === 'admin'
+                    ? 'المدير'
+                    : 'المستخدم'}
+        </p>
         <p className="text-xs mt-1">نظام Pharma</p>
       </div>
     </aside>

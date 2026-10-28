@@ -4,8 +4,9 @@
  * نموذج الصندوق النقدي (الخزينة النقدية).
  *
  * لماذا هذا الملف؟
- * - نُوفّر صناديق نقدية متعددة (رئيسي + فرعي) لدعم التوسّع.
- * - كل صندوق له رصيد حالي يُحدَّث من CashTransaction.
+ * - نُوفّر صناديق نقدية متعددة (رئيسي + فرعي).
+ * - كل صندوق له رصيد حالي (currentBalance) يُحدَّث من CashTransaction.
+ * - virtual `balance` = توافق للقراءة فقط مع الكود القديم.
  * - لا نحذف صندوقاً فيه حركة؛ نُعطّله فقط.
  */
 
@@ -18,9 +19,6 @@ const { Schema, model } = mongoose;
  */
 const cashFundSchema = new Schema(
   {
-    /**
-     * اسم الصندوق (مثال: الصندوق الرئيسي).
-     */
     name: {
       type: String,
       required: [true, 'اسم الصندوق مطلوب.'],
@@ -29,9 +27,6 @@ const cashFundSchema = new Schema(
       maxlength: [100, 'الاسم طويل جداً.'],
     },
 
-    /**
-     * كود فريد.
-     */
     code: {
       type: String,
       required: [true, 'كود الصندوق مطلوب.'],
@@ -41,60 +36,43 @@ const cashFundSchema = new Schema(
       index: true,
     },
 
-    /**
-     * الرصيد الحالي.
-     */
+    /** الرصيد الحالي — الحقل الفعلي في قاعدة البيانات. */
     currentBalance: {
       type: Number,
       default: 0,
     },
 
-    /**
-     * الرصيد الافتتاحي (للرجوع إليه).
-     */
+    /** الرصيد الافتتاحي (للرجوع إليه). */
     openingBalance: {
       type: Number,
       default: 0,
     },
 
-    /**
-     * المخزن/الفرع المرتبط (اختياري).
-     */
+    /** المخزن/الفرع المرتبط (اختياري). */
     warehouse: {
       type: Schema.Types.ObjectId,
       ref: 'Warehouse',
       default: null,
     },
 
-    /**
-     * أمين الصندوق (اختياري).
-     */
+    /** أمين الصندوق (اختياري). */
     custodian: {
       type: Schema.Types.ObjectId,
       ref: 'User',
       default: null,
     },
 
-    /**
-     * هل هو الصندوق الافتراضي؟
-     */
     isDefault: {
       type: Boolean,
       default: false,
     },
 
-    /**
-     * حالة الصندوق.
-     */
     isActive: {
       type: Boolean,
       default: true,
       index: true,
     },
 
-    /**
-     * ملاحظات.
-     */
     notes: {
       type: String,
       trim: true,
@@ -102,9 +80,6 @@ const cashFundSchema = new Schema(
       maxlength: [500, 'الملاحظات طويلة جداً.'],
     },
 
-    /**
-     * من أنشأ الصندوق؟
-     */
     createdBy: {
       type: Schema.Types.ObjectId,
       ref: 'User',
@@ -117,9 +92,40 @@ const cashFundSchema = new Schema(
   }
 );
 
-/**
- * فهرس الصندوق الافتراضي الفريد.
+/* ─────────────────────────────────────────────────────────────
+ * Virtuals — توافق مع الكود القديم
+ * ─────────────────────────────────────────────────────────────
+ * ملاحظة: virtual `balance` يعمل للقراءة والكتابة عبر document.balance.
+ * لكن `updateOne({$inc: {balance}})` لا يعمل (يستخدم اسم الحقل الفعلي).
+ * لذلك cashService.js يستخدم `currentBalance` في $inc.
  */
+
+cashFundSchema
+  .virtual('balance')
+  .get(function getBalance() {
+    return this.currentBalance;
+  })
+  .set(function setBalance(v) {
+    this.currentBalance = v;
+  });
+
+cashFundSchema
+  .virtual('description')
+  .get(function getDescription() {
+    return this.notes || '';
+  })
+  .set(function setDescription(v) {
+    this.notes = v || '';
+  });
+
+// تفعيل virtuals في toJSON / toObject
+cashFundSchema.set('toJSON', { virtuals: true });
+cashFundSchema.set('toObject', { virtuals: true });
+
+/* ─────────────────────────────────────────────────────────────
+ * الفهارس
+ * ───────────────────────────────────────────────────────────── */
+
 cashFundSchema.index(
   { isDefault: 1 },
   {
@@ -129,10 +135,11 @@ cashFundSchema.index(
   }
 );
 
-/**
- * فهرس القوائم.
- */
 cashFundSchema.index({ isActive: 1, name: 1 });
+
+/* ─────────────────────────────────────────────────────────────
+ * Methods
+ * ───────────────────────────────────────────────────────────── */
 
 /**
  * هل الصندوق يسمح بالرصيد السالب؟

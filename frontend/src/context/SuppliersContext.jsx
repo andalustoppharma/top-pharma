@@ -1,33 +1,24 @@
 /**
  * @file SuppliersContext.jsx
- * @description
- * Context API لإدارة حالة الموردين.
+ * @description Context API لإدارة حالة الموردين.
+ *
+ * يُصدّر:
+ *  - SuppliersContext
+ *  - SuppliersProvider
+ *  - useSuppliers (✅ جديد)
+ *  - useSuppliersContext (✅ alias)
  */
 
-import { createContext, useCallback, useMemo, useState } from 'react';
+import { createContext, useCallback, useContext, useMemo, useState } from 'react';
 
 import * as suppliersAPI from '../api/suppliersAPI.js';
 
-// ═══════════════════════════════════════════════
-// 1. إنشاء Context
-// ═══════════════════════════════════════════════
 export const SuppliersContext = createContext(null);
 
-// ═══════════════════════════════════════════════
-// 2. الحالة الابتدائية
-// ═══════════════════════════════════════════════
 const INITIAL_PAGINATION = Object.freeze({
-  page: 1,
-  limit: 20,
-  total: 0,
-  totalPages: 0,
-  hasNext: false,
-  hasPrev: false,
+  page: 1, limit: 20, total: 0, totalPages: 0, hasNext: false, hasPrev: false,
 });
 
-// ═══════════════════════════════════════════════
-// 3. Provider
-// ═══════════════════════════════════════════════
 export function SuppliersProvider({ children }) {
   const [suppliers, setSuppliers] = useState([]);
   const [pagination, setPagination] = useState(INITIAL_PAGINATION);
@@ -37,7 +28,6 @@ export function SuppliersProvider({ children }) {
   const fetchSuppliers = useCallback(async (params = {}) => {
     setLoading(true);
     setError(null);
-
     try {
       const result = await suppliersAPI.listSuppliers(params);
       setSuppliers(result.items || []);
@@ -56,15 +46,13 @@ export function SuppliersProvider({ children }) {
   const createSupplier = useCallback(async (payload) => {
     setLoading(true);
     setError(null);
-
     try {
       const created = await suppliersAPI.createSupplier(payload);
       setSuppliers((prev) => [created, ...prev]);
       setPagination((prev) => ({ ...prev, total: prev.total + 1 }));
       return { success: true, data: created };
     } catch (err) {
-      const message =
-        err?.error?.message || err?.message || 'فشل إنشاء المورّد.';
+      const message = err?.error?.message || err?.message || 'فشل إنشاء المورّد.';
       setError(message);
       return { success: false, error: message };
     } finally {
@@ -75,14 +63,12 @@ export function SuppliersProvider({ children }) {
   const updateSupplier = useCallback(async (id, payload) => {
     setLoading(true);
     setError(null);
-
     try {
       const updated = await suppliersAPI.updateSupplier(id, payload);
       setSuppliers((prev) => prev.map((s) => (s.id === id ? updated : s)));
       return { success: true, data: updated };
     } catch (err) {
-      const message =
-        err?.error?.message || err?.message || 'فشل تعديل المورّد.';
+      const message = err?.error?.message || err?.message || 'فشل تعديل المورّد.';
       setError(message);
       return { success: false, error: message };
     } finally {
@@ -93,7 +79,6 @@ export function SuppliersProvider({ children }) {
   const deleteSupplier = useCallback(async (id) => {
     setLoading(true);
     setError(null);
-
     try {
       await suppliersAPI.deleteSupplier(id);
       setSuppliers((prev) =>
@@ -101,8 +86,7 @@ export function SuppliersProvider({ children }) {
       );
       return { success: true };
     } catch (err) {
-      const message =
-        err?.error?.message || err?.message || 'فشل تعطيل المورّد.';
+      const message = err?.error?.message || err?.message || 'فشل تعطيل المورّد.';
       setError(message);
       return { success: false, error: message };
     } finally {
@@ -112,26 +96,12 @@ export function SuppliersProvider({ children }) {
 
   const value = useMemo(
     () => ({
-      suppliers,
-      pagination,
-      loading,
-      error,
-      fetchSuppliers,
-      createSupplier,
-      updateSupplier,
-      deleteSupplier,
+      suppliers, pagination, loading, error,
+      fetchSuppliers, createSupplier, updateSupplier, deleteSupplier,
       resetError: () => setError(null),
     }),
-    [
-      suppliers,
-      pagination,
-      loading,
-      error,
-      fetchSuppliers,
-      createSupplier,
-      updateSupplier,
-      deleteSupplier,
-    ]
+    [suppliers, pagination, loading, error,
+     fetchSuppliers, createSupplier, updateSupplier, deleteSupplier]
   );
 
   return (
@@ -140,3 +110,18 @@ export function SuppliersProvider({ children }) {
     </SuppliersContext.Provider>
   );
 }
+
+/* ═══════════════════════════════════════════════════════════════
+ * Hooks
+ * ═══════════════════════════════════════════════════════════════ */
+
+export function useSuppliers() {
+  const ctx = useContext(SuppliersContext);
+  if (!ctx) {
+    throw new Error('useSuppliers must be used within SuppliersProvider');
+  }
+  return ctx;
+}
+
+// ✅ Alias للتوافق
+export const useSuppliersContext = useSuppliers;

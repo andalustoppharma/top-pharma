@@ -1,10 +1,15 @@
 /**
  * @file CustomersContext.jsx
  * @description Context API لإدارة حالة الصيدليات.
+ *
+ * يُصدّر:
+ *  - CustomersContext
+ *  - CustomersProvider
+ *  - useCustomers
+ *  - useCustomersContext (✅ alias)
  */
 
-
-import { createContext, useCallback, useMemo, useState } from 'react';
+import { createContext, useCallback, useContext, useMemo, useState } from 'react';
 
 import * as customersAPI from '../api/customersAPI.js';
 
@@ -28,7 +33,6 @@ export function CustomersProvider({ children }) {
   const fetchCustomers = useCallback(async (params = {}) => {
     setLoading(true);
     setError(null);
-
     try {
       const result = await customersAPI.listCustomers(params);
       setCustomers(result.items || []);
@@ -47,7 +51,6 @@ export function CustomersProvider({ children }) {
   const createCustomer = useCallback(async (payload) => {
     setLoading(true);
     setError(null);
-
     try {
       const created = await customersAPI.createCustomer(payload);
       setCustomers((prev) => [created, ...prev]);
@@ -66,7 +69,6 @@ export function CustomersProvider({ children }) {
   const updateCustomer = useCallback(async (id, payload) => {
     setLoading(true);
     setError(null);
-
     try {
       const updated = await customersAPI.updateCustomer(id, payload);
       setCustomers((prev) => prev.map((c) => (c.id === id ? updated : c)));
@@ -84,7 +86,6 @@ export function CustomersProvider({ children }) {
   const deleteCustomer = useCallback(async (id) => {
     setLoading(true);
     setError(null);
-
     try {
       await customersAPI.deleteCustomer(id);
       setCustomers((prev) =>
@@ -101,13 +102,9 @@ export function CustomersProvider({ children }) {
     }
   }, []);
 
-    // ═══════════════════════════════════════════════
-  // إعادة تفعيل صيدلية معطّلة
-  // ═══════════════════════════════════════════════
   const reactivateCustomer = useCallback(async (id) => {
     setLoading(true);
     setError(null);
-
     try {
       const updated = await customersAPI.updateCustomer(id, { isActive: true });
       setCustomers((prev) => prev.map((c) => (c.id === id ? updated : c)));
@@ -154,3 +151,20 @@ export function CustomersProvider({ children }) {
     </CustomersContext.Provider>
   );
 }
+
+/* ═══════════════════════════════════════════════════════════════
+ * Hooks
+ * ═══════════════════════════════════════════════════════════════ */
+
+export function useCustomers() {
+  const ctx = useContext(CustomersContext);
+  if (!ctx) {
+    throw new Error('useCustomers must be used within CustomersProvider');
+  }
+  return ctx;
+}
+
+// ✅ Alias للتوافق
+export const useCustomersContext = useCustomers;
+
+export default useCustomers;

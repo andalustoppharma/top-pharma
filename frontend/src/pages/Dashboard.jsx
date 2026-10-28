@@ -1,19 +1,28 @@
 /**
- * @file DashboardPage.jsx
+ * @file Dashboard.jsx
  * @description
- * لوحة التحكم الرئيسية — Phase 2.5.
+ * لوحة التحكم الرئيسية.
  *
- * لماذا هذا الملف؟
- * - يُعطي المستخدم نظرة سريعة على حالة النظام.
- * - يستخدم الإحصاءات المخزّنة في الـ Contexts (بدون جلب إضافي).
- * - يوجّه المستخدم للأقسام الأكثر أهمية (حسب دوره).
- * - مؤقتاً بسيط — سيتوسّع في Phase 4 مع التقارير الكاملة.
+ * يستخدم الإحصاءات المخزّنة في الـ Contexts (بدون جلب إضافي).
+ * يوجّه المستخدم للأقسام حسب دوره.
+ *
+ * ✅ Phase 4: إضافة بطاقة "مركز التقارير" في الوصول السريع.
  */
 
 import { Link } from 'react-router-dom';
 import {
-  FileText, Truck, Undo2, Receipt, ArrowLeftRight, Package,
-  AlertCircle, TrendingUp, Users, Boxes,
+  FileText,
+  Truck,
+  Undo2,
+  Receipt,
+  ArrowLeftRight,
+  Package,
+  AlertCircle,
+  TrendingUp,
+  Users,
+  Boxes,
+  BarChart3,
+  Wallet,
 } from 'lucide-react';
 
 import { useAuth } from '../hooks/useAuth.js';
@@ -88,10 +97,9 @@ function QuickLink({ to, icon: Icon, title, description, color = 'primary' }) {
 // 2. المكون الرئيسي
 // ═══════════════════════════════════════════════
 
-function DashboardPage() {
+function Dashboard() {
   const { user, userName, isAdmin, isAccountant, isSalesRep, isStorekeeper } = useAuth();
 
-  // إحصاءات سريعة (من الـ Contexts — لا جلب إضافي)
   const { stats: invoiceStats } = useInvoices();
   const { stats: deliveryStats } = useDeliveryNotes();
   const { stats: returnStats } = useCustomerReturns();
@@ -99,6 +107,7 @@ function DashboardPage() {
 
   const canSeeFinance = isAdmin || isAccountant;
   const canSeeSales = isAdmin || isAccountant || isSalesRep;
+  const canSeeReports = isAdmin || isAccountant;
 
   return (
     <div className="space-y-6">
@@ -188,6 +197,44 @@ function DashboardPage() {
         </div>
       )}
 
+      {/* ═══ التقارير (Phase 4) ═══ */}
+      {canSeeReports && (
+        <div>
+          <h2 className="text-lg font-bold text-neutral-900 mb-3">التقارير والتحليلات</h2>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <Link
+              to="/reports"
+              className="group flex items-start gap-3 p-4 bg-primary-50 border border-primary-200 rounded-lg hover:bg-primary-100 transition-colors"
+            >
+              <div className="w-12 h-12 rounded-xl bg-primary-600 text-white flex items-center justify-center flex-shrink-0">
+                <BarChart3 size={22} />
+              </div>
+              <div className="min-w-0 flex-1">
+                <p className="font-bold text-primary-900">مركز التقارير</p>
+                <p className="text-xs text-primary-800 mt-1">
+                  11 تقريراً متاحاً — مالية ومبيعات
+                </p>
+              </div>
+            </Link>
+
+            <Link
+              to="/reports/finance"
+              className="group flex items-start gap-3 p-4 bg-success-50 border border-success-200 rounded-lg hover:bg-success-100 transition-colors"
+            >
+              <div className="w-12 h-12 rounded-xl bg-success-600 text-white flex items-center justify-center flex-shrink-0">
+                <Wallet size={22} />
+              </div>
+              <div className="min-w-0 flex-1">
+                <p className="font-bold text-success-900">التقارير المالية</p>
+                <p className="text-xs text-success-800 mt-1">
+                  ميزان المراجعة، الحركات، الشيكات، المصروفات
+                </p>
+              </div>
+            </Link>
+          </div>
+        </div>
+      )}
+
       {/* ═══ الوصول السريع ═══ */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {canSeeSales && (
@@ -245,7 +292,7 @@ function DashboardPage() {
         </Card>
       </div>
 
-      {/* ═══ المشتريات (للمحاسب/أمين المخزن) ═══ */}
+      {/* ═══ المشتريات ═══ */}
       {(canSeeFinance || isStorekeeper) && (
         <Card title="المشتريات والموردون" icon={Receipt}>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
@@ -267,17 +314,17 @@ function DashboardPage() {
         </Card>
       )}
 
-      {/* ═══ ملاحظة للمستخدم ═══ */}
+      {/* ═══ الفوتر ═══ */}
       <div className="text-center text-xs text-neutral-500 pt-4">
         <p>
           مرحباً بك في نظام Pharma System — شركة TOP PHARMA MEDICAL COMPANY
         </p>
         <p className="mt-1">
-          مرحلة {isAdmin ? 'Phase 2 مكتملة' : 'قيد الاستخدام'} — دورك: <strong>{user?.role || '—'}</strong>
+          المرحلة الحالية: <strong>Phase 4 — التقارير</strong> — دورك: <strong>{user?.role || '—'}</strong>
         </p>
       </div>
     </div>
   );
 }
 
-export default DashboardPage;
+export default Dashboard;

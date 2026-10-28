@@ -1,52 +1,33 @@
 /**
  * @file WarehousesContext.jsx
- * @description
- * Context API لإدارة حالة المخازن.
+ * @description Context API لإدارة حالة المخازن.
  *
- * لماذا هذا الملف؟
- * - مصدر واحد لبيانات المخازن.
- * - يمنع الاستعلامات المتكررة.
- * - يوفّر دوال CRUD + setAsMain + setAsDefault.
- * - يتبع نمط CategoriesContext.jsx.
+ * يُصدّر:
+ *  - WarehousesContext
+ *  - WarehousesProvider
+ *  - useWarehouses (✅ جديد)
+ *  - useWarehousesContext (✅ alias)
  */
 
-import { createContext, useCallback, useMemo, useState } from 'react';
+import { createContext, useCallback, useContext, useMemo, useState } from 'react';
 
 import * as warehousesAPI from '../api/warehousesAPI.js';
 
-// ═══════════════════════════════════════════════
-// 1. إنشاء Context
-// ═══════════════════════════════════════════════
 export const WarehousesContext = createContext(null);
 
-// ═══════════════════════════════════════════════
-// 2. الحالة الابتدائية
-// ═══════════════════════════════════════════════
 const INITIAL_PAGINATION = Object.freeze({
-  page: 1,
-  limit: 20,
-  total: 0,
-  totalPages: 0,
-  hasNext: false,
-  hasPrev: false,
+  page: 1, limit: 20, total: 0, totalPages: 0, hasNext: false, hasPrev: false,
 });
 
-// ═══════════════════════════════════════════════
-// 3. Provider
-// ═══════════════════════════════════════════════
 export function WarehousesProvider({ children }) {
   const [warehouses, setWarehouses] = useState([]);
   const [pagination, setPagination] = useState(INITIAL_PAGINATION);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
 
-  // ═══════════════════════════════════════════════
-  // 4. القراءة
-  // ═══════════════════════════════════════════════
   const fetchWarehouses = useCallback(async (params = {}) => {
     setLoading(true);
     setError(null);
-
     try {
       const result = await warehousesAPI.listWarehouses(params);
       setWarehouses(result.items || []);
@@ -62,20 +43,14 @@ export function WarehousesProvider({ children }) {
     }
   }, []);
 
-  // ═══════════════════════════════════════════════
-  // 5. الإنشاء
-  // ═══════════════════════════════════════════════
   const createWarehouse = useCallback(async (payload) => {
     setLoading(true);
     setError(null);
-
     try {
       const created = await warehousesAPI.createWarehouse(payload);
-      // نُعيد الجلب لتحديث isDefault/type (قد يتأثر بمخازن أخرى).
       return { success: true, data: created, needsRefresh: true };
     } catch (err) {
-      const message =
-        err?.error?.message || err?.message || 'فشل إنشاء المخزن.';
+      const message = err?.error?.message || err?.message || 'فشل إنشاء المخزن.';
       setError(message);
       return { success: false, error: message };
     } finally {
@@ -83,22 +58,15 @@ export function WarehousesProvider({ children }) {
     }
   }, []);
 
-  // ═══════════════════════════════════════════════
-  // 6. التعديل
-  // ═══════════════════════════════════════════════
   const updateWarehouse = useCallback(async (id, payload) => {
     setLoading(true);
     setError(null);
-
     try {
       const updated = await warehousesAPI.updateWarehouse(id, payload);
-      setWarehouses((prev) =>
-        prev.map((w) => (w.id === id ? updated : w))
-      );
+      setWarehouses((prev) => prev.map((w) => (w.id === id ? updated : w)));
       return { success: true, data: updated };
     } catch (err) {
-      const message =
-        err?.error?.message || err?.message || 'فشل تعديل المخزن.';
+      const message = err?.error?.message || err?.message || 'فشل تعديل المخزن.';
       setError(message);
       return { success: false, error: message };
     } finally {
@@ -106,13 +74,9 @@ export function WarehousesProvider({ children }) {
     }
   }, []);
 
-  // ═══════════════════════════════════════════════
-  // 7. الحذف
-  // ═══════════════════════════════════════════════
   const deleteWarehouse = useCallback(async (id) => {
     setLoading(true);
     setError(null);
-
     try {
       await warehousesAPI.deleteWarehouse(id);
       setWarehouses((prev) =>
@@ -120,8 +84,7 @@ export function WarehousesProvider({ children }) {
       );
       return { success: true };
     } catch (err) {
-      const message =
-        err?.error?.message || err?.message || 'فشل تعطيل المخزن.';
+      const message = err?.error?.message || err?.message || 'فشل تعطيل المخزن.';
       setError(message);
       return { success: false, error: message };
     } finally {
@@ -129,20 +92,14 @@ export function WarehousesProvider({ children }) {
     }
   }, []);
 
-  // ═══════════════════════════════════════════════
-  // 8. تعيين رئيسي / افتراضي
-  // ═══════════════════════════════════════════════
   const setAsMain = useCallback(async (id) => {
     setLoading(true);
     setError(null);
-
     try {
       await warehousesAPI.setWarehouseAsMain(id);
-      // نُعيد الجلب لأن مخزناً آخر قد تغيّر إلى branch.
       return { success: true, needsRefresh: true };
     } catch (err) {
-      const message =
-        err?.error?.message || err?.message || 'فشل تعيين المخزن رئيسياً.';
+      const message = err?.error?.message || err?.message || 'فشل تعيين المخزن رئيسياً.';
       setError(message);
       return { success: false, error: message };
     } finally {
@@ -153,13 +110,11 @@ export function WarehousesProvider({ children }) {
   const setAsDefault = useCallback(async (id) => {
     setLoading(true);
     setError(null);
-
     try {
       await warehousesAPI.setWarehouseAsDefault(id);
       return { success: true, needsRefresh: true };
     } catch (err) {
-      const message =
-        err?.error?.message || err?.message || 'فشل تعيين المخزن افتراضياً.';
+      const message = err?.error?.message || err?.message || 'فشل تعيين المخزن افتراضياً.';
       setError(message);
       return { success: false, error: message };
     } finally {
@@ -167,13 +122,9 @@ export function WarehousesProvider({ children }) {
     }
   }, []);
 
-    // ═══════════════════════════════════════════════
-  // 8.b إعادة تفعيل مخزن معطّل
-  // ═══════════════════════════════════════════════
   const reactivateWarehouse = useCallback(async (id) => {
     setLoading(true);
     setError(null);
-
     try {
       const updated = await warehousesAPI.updateWarehouse(id, { isActive: true });
       setWarehouses((prev) => prev.map((w) => (w.id === id ? updated : w)));
@@ -188,37 +139,16 @@ export function WarehousesProvider({ children }) {
     }
   }, []);
 
-  // ═══════════════════════════════════════════════
-  // 9. القيمة المُصدَّرة
-  // ═══════════════════════════════════════════════
   const value = useMemo(
     () => ({
-      warehouses,
-      pagination,
-      loading,
-      error,
-      fetchWarehouses,
-      createWarehouse,
-      updateWarehouse,
-      deleteWarehouse,
-      setAsMain,
-      setAsDefault,
-      reactivateWarehouse,
+      warehouses, pagination, loading, error,
+      fetchWarehouses, createWarehouse, updateWarehouse, deleteWarehouse,
+      setAsMain, setAsDefault, reactivateWarehouse,
       resetError: () => setError(null),
     }),
-    [
-      warehouses,
-      pagination,
-      loading,
-      error,
-      fetchWarehouses,
-      createWarehouse,
-      updateWarehouse,
-      deleteWarehouse,
-      setAsMain,
-      setAsDefault,
-      reactivateWarehouse,
-    ]
+    [warehouses, pagination, loading, error,
+     fetchWarehouses, createWarehouse, updateWarehouse, deleteWarehouse,
+     setAsMain, setAsDefault, reactivateWarehouse]
   );
 
   return (
@@ -227,3 +157,18 @@ export function WarehousesProvider({ children }) {
     </WarehousesContext.Provider>
   );
 }
+
+/* ═══════════════════════════════════════════════════════════════
+ * Hooks
+ * ═══════════════════════════════════════════════════════════════ */
+
+export function useWarehouses() {
+  const ctx = useContext(WarehousesContext);
+  if (!ctx) {
+    throw new Error('useWarehouses must be used within WarehousesProvider');
+  }
+  return ctx;
+}
+
+// ✅ Alias للتوافق
+export const useWarehousesContext = useWarehouses;

@@ -1,9 +1,15 @@
 /**
  * @file StockContext.jsx
- * @description Context API لإدارة حالة المخزون (الدفعات).
+ * @description Context API لإدارة حالة المخزون.
+ *
+ * يُصدّر:
+ *  - StockContext
+ *  - StockProvider
+ *  - useStock (✅ جديد)
+ *  - useStockContext (✅ alias)
  */
 
-import { createContext, useCallback, useMemo, useState } from 'react';
+import { createContext, useCallback, useContext, useMemo, useState } from 'react';
 
 import * as stocksAPI from '../api/stocksAPI.js';
 
@@ -24,17 +30,12 @@ export function StockProvider({ children }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
 
-  // ✅ مؤشرات سريعة للواجهة (لا تُحمَّل تلقائياً — عند الحاجة فقط)
   const [expiringSoon, setExpiringSoon] = useState({ count: 0, thresholdDays: 0, items: [] });
   const [belowReorder, setBelowReorder] = useState({ count: 0, items: [] });
 
-  // ═══════════════════════════════════════════════
-  // 1. القراءة
-  // ═══════════════════════════════════════════════
   const fetchStocks = useCallback(async (params = {}) => {
     setLoading(true);
     setError(null);
-
     try {
       const result = await stocksAPI.listStocks(params);
       setStocks(result.items || []);
@@ -72,20 +73,14 @@ export function StockProvider({ children }) {
     }
   }, []);
 
-  // ═══════════════════════════════════════════════
-  // 2. الإنشاء
-  // ═══════════════════════════════════════════════
   const createStock = useCallback(async (payload) => {
     setLoading(true);
     setError(null);
-
     try {
       const created = await stocksAPI.createStock(payload);
-      // نُعيد الجلب بدل الإضافة المحلية (لأن الكمية قد تُدمج مع دفعة موجودة).
       return { success: true, data: created, needsRefresh: true };
     } catch (err) {
-      const message =
-        err?.error?.message || err?.message || 'فشل استلام الدفعة.';
+      const message = err?.error?.message || err?.message || 'فشل استلام الدفعة.';
       setError(message);
       return { success: false, error: message };
     } finally {
@@ -93,20 +88,15 @@ export function StockProvider({ children }) {
     }
   }, []);
 
-  // ═══════════════════════════════════════════════
-  // 3. التعديل
-  // ═══════════════════════════════════════════════
   const updateStock = useCallback(async (id, payload) => {
     setLoading(true);
     setError(null);
-
     try {
       const updated = await stocksAPI.updateStock(id, payload);
       setStocks((prev) => prev.map((s) => (s.id === id ? updated : s)));
       return { success: true, data: updated };
     } catch (err) {
-      const message =
-        err?.error?.message || err?.message || 'فشل تعديل الدفعة.';
+      const message = err?.error?.message || err?.message || 'فشل تعديل الدفعة.';
       setError(message);
       return { success: false, error: message };
     } finally {
@@ -114,20 +104,15 @@ export function StockProvider({ children }) {
     }
   }, []);
 
-  // ═══════════════════════════════════════════════
-  // 4. الحذف
-  // ═══════════════════════════════════════════════
   const deleteStock = useCallback(async (id) => {
     setLoading(true);
     setError(null);
-
     try {
       await stocksAPI.deleteStock(id);
       setStocks((prev) => prev.filter((s) => s.id !== id));
       return { success: true };
     } catch (err) {
-      const message =
-        err?.error?.message || err?.message || 'فشل حذف الدفعة.';
+      const message = err?.error?.message || err?.message || 'فشل حذف الدفعة.';
       setError(message);
       return { success: false, error: message };
     } finally {
@@ -135,40 +120,32 @@ export function StockProvider({ children }) {
     }
   }, []);
 
-  // ═══════════════════════════════════════════════
-  // 5. القيمة المُصدَّرة
-  // ═══════════════════════════════════════════════
   const value = useMemo(
     () => ({
-      stocks,
-      pagination,
-      loading,
-      error,
-      expiringSoon,
-      belowReorder,
-      fetchStocks,
-      fetchExpiringSoon,
-      fetchBelowReorder,
-      createStock,
-      updateStock,
-      deleteStock,
+      stocks, pagination, loading, error, expiringSoon, belowReorder,
+      fetchStocks, fetchExpiringSoon, fetchBelowReorder,
+      createStock, updateStock, deleteStock,
       resetError: () => setError(null),
     }),
-    [
-      stocks,
-      pagination,
-      loading,
-      error,
-      expiringSoon,
-      belowReorder,
-      fetchStocks,
-      fetchExpiringSoon,
-      fetchBelowReorder,
-      createStock,
-      updateStock,
-      deleteStock,
-    ]
+    [stocks, pagination, loading, error, expiringSoon, belowReorder,
+     fetchStocks, fetchExpiringSoon, fetchBelowReorder,
+     createStock, updateStock, deleteStock]
   );
 
   return <StockContext.Provider value={value}>{children}</StockContext.Provider>;
 }
+
+/* ═══════════════════════════════════════════════════════════════
+ * Hooks
+ * ═══════════════════════════════════════════════════════════════ */
+
+export function useStock() {
+  const ctx = useContext(StockContext);
+  if (!ctx) {
+    throw new Error('useStock must be used within StockProvider');
+  }
+  return ctx;
+}
+
+// ✅ Alias للتوافق
+export const useStockContext = useStock;

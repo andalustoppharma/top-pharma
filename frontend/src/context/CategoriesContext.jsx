@@ -2,25 +2,19 @@
  * @file CategoriesContext.jsx
  * @description Context API لإدارة حالة التصنيفات.
  *
- * لماذا هذا الملف؟
- * - مصدر واحد لبيانات التصنيفات في كل التطبيق.
- * - يمنع الاستعلامات المتكررة (cache في الذاكرة).
- * - يوفّر دوال CRUD موحّدة تُستخدم من أي مكوّن.
- * - يتبع نمط AuthContext.jsx (useCallback + useMemo).
+ * يُصدّر:
+ *  - CategoriesContext
+ *  - CategoriesProvider
+ *  - useCategories (✅ جديد)
+ *  - useCategoriesContext (✅ alias للتوافق)
  */
 
-import { createContext, useCallback, useMemo, useState } from 'react';
+import { createContext, useCallback, useContext, useMemo, useState } from 'react';
 
 import * as categoriesAPI from '../api/categoriesAPI.js';
 
-// ═══════════════════════════════════════════════
-// 1. إنشاء Context
-// ═══════════════════════════════════════════════
 export const CategoriesContext = createContext(null);
 
-// ═══════════════════════════════════════════════
-// 2. الحالة الابتدائية
-// ═══════════════════════════════════════════════
 const INITIAL_PAGINATION = Object.freeze({
   page: 1,
   limit: 20,
@@ -30,22 +24,15 @@ const INITIAL_PAGINATION = Object.freeze({
   hasPrev: false,
 });
 
-// ═══════════════════════════════════════════════
-// 3. Provider
-// ═══════════════════════════════════════════════
 export function CategoriesProvider({ children }) {
   const [categories, setCategories] = useState([]);
   const [pagination, setPagination] = useState(INITIAL_PAGINATION);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
 
-  // ═══════════════════════════════════════════════
-  // 4. القراءة
-  // ═══════════════════════════════════════════════
   const fetchCategories = useCallback(async (params = {}) => {
     setLoading(true);
     setError(null);
-
     try {
       const result = await categoriesAPI.listCategories(params);
       setCategories(result.items || []);
@@ -61,13 +48,9 @@ export function CategoriesProvider({ children }) {
     }
   }, []);
 
-  // ═══════════════════════════════════════════════
-  // 5. الإنشاء
-  // ═══════════════════════════════════════════════
   const createCategory = useCallback(async (payload) => {
     setLoading(true);
     setError(null);
-
     try {
       const created = await categoriesAPI.createCategory(payload);
       setCategories((prev) => [...prev, created]);
@@ -83,13 +66,9 @@ export function CategoriesProvider({ children }) {
     }
   }, []);
 
-  // ═══════════════════════════════════════════════
-  // 6. التعديل
-  // ═══════════════════════════════════════════════
   const updateCategory = useCallback(async (id, payload) => {
     setLoading(true);
     setError(null);
-
     try {
       const updated = await categoriesAPI.updateCategory(id, payload);
       setCategories((prev) =>
@@ -106,13 +85,9 @@ export function CategoriesProvider({ children }) {
     }
   }, []);
 
-  // ═══════════════════════════════════════════════
-  // 7. الحذف
-  // ═══════════════════════════════════════════════
   const deleteCategory = useCallback(async (id) => {
     setLoading(true);
     setError(null);
-
     try {
       await categoriesAPI.deleteCategory(id);
       setCategories((prev) =>
@@ -131,9 +106,6 @@ export function CategoriesProvider({ children }) {
     }
   }, []);
 
-  // ═══════════════════════════════════════════════
-  // 8. القيمة المُصدَّرة
-  // ═══════════════════════════════════════════════
   const value = useMemo(
     () => ({
       categories,
@@ -164,3 +136,18 @@ export function CategoriesProvider({ children }) {
     </CategoriesContext.Provider>
   );
 }
+
+/* ═══════════════════════════════════════════════════════════════
+ * Hooks
+ * ═══════════════════════════════════════════════════════════════ */
+
+export function useCategories() {
+  const ctx = useContext(CategoriesContext);
+  if (!ctx) {
+    throw new Error('useCategories must be used within CategoriesProvider');
+  }
+  return ctx;
+}
+
+// ✅ Alias للتوافق
+export const useCategoriesContext = useCategories;

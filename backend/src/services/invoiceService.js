@@ -1,769 +1,941 @@
 /**
  * @file invoiceService.js
  * @description
- * منطق الفواتير المركّب — Phase 2.5.
+ * منطق الفواتير (Invoice) — نقدي / آجل / أقساط.
  *
- * ⚠️ التغييرات الحاسمة في Phase 2.5:
- * 1. إصلاح Bug: إذا الفاتورة مرتبطة بـ DeliveryNote → لا تخصم Stock (مخصوم مسبقاً).
- * 2. دمج priceValidationService: التحقق من الأسعار قبل الحفظ.
- * 3. overrideReason: إلزامي عند التجاوز (مع صلاحية).
- * 4. تنبيه الأدمن: بعد حفظ فاتورة بتجاوز (عبر Notification).
+ * Phase 2: إنشاء، اعتماد، دفع، إلغاء، عمولة، FEFO.
+ * Phase 2.5: مسودات (draft)، تقييد أسعار، إصلاح double-deduction.
+ * Phase 3: ربط بصندوق نقدي (cashFundId)، قيود محاسبية تلقائية، COGS.
+ *
+ * المبادئ:
+ *  - كل فاتورة نقدية/جزئية → CashTransaction + SALE_CASH entry + COGS entry.
+ *  - كل فاتورة آجلة → SALE_CREDIT entry + تحديث Customer.currentBalance.
+ *  - لا نخصم Stock إذا Invoice.deliveryNote موجود (مخصوم في الإيصال).
+ *  - العمولة تُحسب عند الاعتماد فقط.
+ *  - القيود immutable — الإلغاء يُنشئ قيوداً عكسية.
  */
 
 import mongoose from 'mongoose';
-
-import { AUDIT_ACTIONS } from '../models/AuditLog.js';
-import { Customer } from '../models/Customer.js';
-import { Invoice, INVOICE_STATUSES } from '../models/Invoice.js';
-import { DeliveryNote } from '../models/DeliveryNote.js';
-import { Commission } from '../models/Commission.js';
-import { SalesRepTransaction } from '../models/SalesRepTransaction.js';
-import { CashTransaction } from '../models/CashTransaction.js';
-import { Warehouse } from '../models/Warehouse.js';
-import { Settings } from '../models/Settings.js';
-import { Stock } from '../models/Stock.js';
-import { Notification, NOTIFICATION_TYPES, NOTIFICATION_LEVELS } from '../models/Notification.js';
-import { User, USER_ROLES } from '../models/User.js';
-
+import Invoice from '../models/Invoice.js';
+import Customer from '../models/Customer.js';
+import Item from '../models/Item.js';
+import DeliveryNote from '../models/DeliveryNote.js';
+import Commission from '../models/Commission.js';
+import SalesRepTransaction from '../models/SalesRepTransaction.js';
+import cashService from './cashService.js';
+import accountingService from './accountingService.js';
+import priceValidationService from './priceValidationService.js';
 import { issueStock, returnStock } from './stockService.js';
-import { validateInvoicePrices } from './priceValidationService.js';
 import { AppError } from '../middlewares/errorMiddleware.js';
 import { logAuditEvent } from '../middlewares/auditLogMiddleware.js';
-import { logger } from '../utils/logger.js';
+import { AUDIT_ACTIONS } from '../utils/constants.js';
+import logger from '../utils/logger.js';
 
-// ============================================================
-// Helpers
-// ============================================================
+const round2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
 
-async function generateInvoiceNumber() {
-  const settings = await Settings.getSettings();
-  const prefix = settings.sales?.prefixes?.invoice || 'INV';
-  const dateStr = new Date().toISOString().slice(0, 10).replace(/-/g, '');
-  const lastInvoice = await Invoice.findOne({ invoiceNumber: new RegExp(`^${prefix}-${dateStr}-`) })
-    .sort({ invoiceNumber: -1 }).select('invoiceNumber').lean();
-  let sequence = 1;
-  if (lastInvoice) {
-    const parts = lastInvoice.invoiceNumber.split('-');
-    sequence = parseInt(parts[parts.length - 1], 10) + 1;
-  }
-  return `${prefix}-${dateStr}-${String(sequence).padStart(4, '0')}`;
-}
-
-function generateTransactionNumber(prefix) {
-  return `${prefix}-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
-}
-
-function calculateTotals(items, discount, taxRate) {
-  const subtotal = items.reduce((sum, item) => sum + (item.total || 0), 0);
-  let discountAmount = 0;
-  if (discount?.type === 'percentage') discountAmount = (subtotal * (discount.value || 0)) / 100;
-  else if (discount?.type === 'fixed') discountAmount = discount.value || 0;
-  const taxableAmount = Math.max(0, subtotal - discountAmount);
-  const taxAmount = (taxableAmount * (taxRate || 0)) / 100;
-  const total = taxableAmount + taxAmount;
-  return {
-    subtotal: Math.round(subtotal * 100) / 100,
-    discountAmount: Math.round(discountAmount * 100) / 100,
-    taxAmount: Math.round(taxAmount * 100) / 100,
-    total: Math.round(total * 100) / 100,
-  };
-}
-
-async function calculateCommission(salesRepId, salesAmount) {
-  const commissionConfig = await Commission.findOne({ salesRep: salesRepId, isActive: true }).lean();
-  if (!commissionConfig) return { rate: 0, amount: 0 };
-  let amount = 0;
-  const rate = commissionConfig.baseRate || 0;
-  if (commissionConfig.baseCommission === 'percentage') amount = (salesAmount * rate) / 100;
-  else if (commissionConfig.baseCommission === 'fixed') amount = rate;
-  if (commissionConfig.tiers?.length > 0) {
-    const tier = commissionConfig.tiers.find((t) => salesAmount >= t.minSales && salesAmount <= t.maxSales);
-    if (tier) amount += (salesAmount * tier.bonusRate) / 100;
-  }
-  return { rate, amount: Math.round(amount * 100) / 100 };
-}
-
-async function ensureCustomerUsable(pharmacyId) {
-  const customer = await Customer.findById(pharmacyId);
-  if (!customer) throw new AppError('الصيدلية غير موجودة.', 404, 'CUSTOMER_NOT_FOUND');
-  if (!customer.isActive) throw new AppError('الصيدلية معطّلة.', 403, 'CUSTOMER_INACTIVE');
-  if (customer.isBlocked) throw new AppError(`الصيدلية محظورة. السبب: ${customer.blockReason || 'غير محدد'}`, 403, 'CUSTOMER_BLOCKED');
-  return customer;
-}
-
-async function ensureWarehouseActive(warehouseId) {
-  const warehouse = await Warehouse.findOne({ _id: warehouseId, isActive: true });
-  if (!warehouse) throw new AppError('المخزن غير موجود أو معطّل.', 400, 'WAREHOUSE_NOT_FOUND');
-  return warehouse;
-}
+/* ─────────────────────────────────────────────────────────────
+ * 1) Helpers
+ * ───────────────────────────────────────────────────────────── */
 
 /**
- * ✅ Phase 2.5: إشعار الأدمن (فقط) عند تجاوز أسعار.
- * - لا يُنشأ إذا لم يوجد override.
- * - يُرسَل لكل admin نشط.
- * - بعد حفظ الفاتورة (لأنها تحتاج _id).
+ * يُولّد رقم فاتورة فريد: INV-YYYYMM-000001
+ * @returns {Promise<string>}
  */
-async function notifyAdminAboutPriceOverride({ invoice, overrideResults, overrideReason, req }) {
-  if (!overrideResults || overrideResults.length === 0) return;
+const generateInvoiceNumber = async () => {
+  const now = new Date();
+  const yyyymm = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}`;
+  const prefix = `INV-${yyyymm}-`;
 
-  try {
-    const admins = await User.find({ role: USER_ROLES.ADMIN, isActive: true })
-      .select('_id email name')
-      .lean();
+  const lastInvoice = await Invoice.findOne({
+    invoiceNumber: { $regex: `^${prefix}` },
+  })
+    .sort({ invoiceNumber: -1 })
+    .select('invoiceNumber')
+    .lean();
 
-    if (admins.length === 0) return;
-
-    const overriddenItems = overrideResults.filter((r) => r.status === 'WARN_OVERRIDE');
-    if (overriddenItems.length === 0) return;
-
-    const itemSummary = overriddenItems
-      .map((r) => `• ${r.batch} — السعر ${r.unitPrice} (الحد الموصى به ${r.limits?.recommendedMin || '—'})`)
-      .join('\n');
-
-    const title = `⚠️ تجاوز أسعار في فاتورة ${invoice.invoiceNumber}`;
-    const message = `${req.user.name} (${req.user.role}) خفّض أسعار ${overriddenItems.length} بند بمبلغ ${invoice.total} SDG.\nالسبب: ${overrideReason}\n${itemSummary}`;
-
-    for (const admin of admins) {
-      // eslint-disable-next-line no-await-in-loop
-      await Notification.create({
-        recipient: admin._id,
-        type: NOTIFICATION_TYPES.SYSTEM,
-        level: NOTIFICATION_LEVELS.WARNING,
-        title,
-        message,
-        link: `/sales/invoices/${invoice._id}`,
-        reference: { type: 'Invoice', id: invoice._id },
-        meta: {
-          invoiceNumber: invoice.invoiceNumber,
-          overrideReason,
-          overriddenItems: overriddenItems.map((r) => ({
-            batch: r.batch,
-            unitPrice: r.unitPrice,
-            recommendedMin: r.limits?.recommendedMin,
-          })),
-          actor: { id: req.user._id, name: req.user.name, role: req.user.role },
-        },
-      });
-    }
-
-    logger.info(
-      `[priceOverride] أُرسِل تنبيه لـ ${admins.length} أدمن بخصوص فاتورة ${invoice.invoiceNumber}`
-    );
-  } catch (error) {
-    // لا نُفشل الفاتورة بسبب خطأ في الإشعار
-    logger.error(`فشل إرسال تنبيه تجاوز السعر: ${error.message}`);
+  let sequence = 1;
+  if (lastInvoice?.invoiceNumber) {
+    const lastSeq = parseInt(lastInvoice.invoiceNumber.split('-')[2], 10);
+    if (!Number.isNaN(lastSeq)) sequence = lastSeq + 1;
   }
-}
 
-// ============================================================
-// 1) إنشاء فاتورة نهائية (مُصلح Bug + تقييد سعر)
-// ============================================================
+  return `${prefix}${String(sequence).padStart(6, '0')}`;
+};
 
-export async function createInvoice({ data, req }) {
-  const {
-    pharmacy: pharmacyId, salesRep: salesRepId, deliveryNote: deliveryNoteId,
-    warehouse: warehouseId, items, discount, taxRate, paymentType, dueDate,
-    totalInstallments, paidAmount, paymentMethod, invoiceDate, notes,
-    overrideReason,
-  } = data;
+/**
+ * يحسب المجاميع من items + discount + taxRate.
+ * @param {Array} items
+ * @param {number} discount - قيمة الخصم (مبلغ ثابت)
+ * @param {number} taxRate - نسبة الضريبة (0-100)
+ * @returns {{ subtotal, discountAmount, taxAmount, total }}
+ */
+const calculateTotals = (items, discount = 0, taxRate = 0) => {
+  const subtotal = round2(
+    items.reduce((sum, it) => sum + Number(it.unitPrice) * Number(it.quantity), 0)
+  );
+  const discountAmount = round2(Number(discount) || 0);
+  const taxableAmount = round2(subtotal - discountAmount);
+  const taxAmount = round2(taxableAmount * (Number(taxRate) / 100));
+  const total = round2(taxableAmount + taxAmount);
+  return { subtotal, discountAmount, taxAmount, total };
+};
 
-  // ═══════════════════════════════════════════════
-  // 1. التحقق من الصيدلية
-  // ═══════════════════════════════════════════════
-  const customer = await ensureCustomerUsable(pharmacyId);
+/**
+ * يحسب تكلفة البضاعة المباعة من الدفعات المصروفة.
+ * @param {Array<{ quantity: number, unitCost: number }>} issuedLots
+ * @returns {number}
+ */
+const calculateIssuedCost = (issuedLots) => {
+  if (!Array.isArray(issuedLots)) return 0;
+  return round2(
+    issuedLots.reduce((sum, lot) => sum + Number(lot.unitCost || 0) * Number(lot.quantity || 0), 0)
+  );
+};
 
-  if (paymentType !== 'cash' && customer.wouldExceedCredit(data.total)) {
+/**
+ * يتحقق أن بنود الفاتورة متوافقة مع إيصال التسليم (لمنع double-deduction).
+ * @param {string} deliveryNoteId
+ * @param {Array} items
+ * @returns {Promise<Object>} deliveryNote
+ */
+const validateDeliveryNoteItems = async (deliveryNoteId, items) => {
+  const dn = await DeliveryNote.findById(deliveryNoteId);
+  if (!dn) {
+    throw new AppError('إيصال التسليم غير موجود', 404, 'DELIVERY_NOTE_NOT_FOUND');
+  }
+
+  // كل بند في الفاتورة يجب أن يكون موجوداً في الإيصال بنفس الكمية أو أقل
+  for (const invItem of items) {
+    const dnItem = dn.items.find(
+      (d) => String(d.itemId) === String(invItem.itemId) &&
+             String(d.batch) === String(invItem.batch)
+    );
+    if (!dnItem) {
+      throw new AppError(
+        `البند ${invItem.itemId} (دفعة ${invItem.batch}) غير موجود في إيصال التسليم`,
+        400,
+        'ITEM_NOT_IN_DELIVERY_NOTE'
+      );
+    }
+    if (invItem.quantity > dnItem.quantity) {
+      throw new AppError(
+        `كمية ${invItem.itemId} تتجاوز كمية الإيصال (${invItem.quantity} > ${dnItem.quantity})`,
+        400,
+        'QUANTITY_EXCEEDS_DELIVERY_NOTE'
+      );
+    }
+  }
+
+  return dn;
+};
+
+/**
+ * يتحقق من صحة كل بند سعراً وكمية.
+ * @param {Array} items
+ * @param {Object} overrides - { overrideReason, user }
+ */
+const validateItemsPrices = async (items, { overrideReason, user }) => {
+  if (!Array.isArray(items) || items.length === 0) {
+    throw new AppError('الفاتورة تحتاج بنداً واحداً على الأقل', 400, 'EMPTY_ITEMS');
+  }
+
+  for (const line of items) {
+    if (!line.itemId || !line.quantity || line.quantity <= 0) {
+      throw new AppError('بند غير صحيح (itemId/quantity)', 400, 'INVALID_LINE');
+    }
+    if (typeof line.unitPrice !== 'number' || line.unitPrice < 0) {
+      throw new AppError('سعر البند غير صحيح', 400, 'INVALID_UNIT_PRICE');
+    }
+  }
+
+  // تقييد الأسعار (Phase 2.5) — يُمرَّر للـ priceValidationService
+  try {
+    await priceValidationService.validateInvoicePrices({
+      items,
+      user,
+      overrideReason,
+    });
+  } catch (err) {
+    // إذا كان الخطأ من نوع PRICE_BELOW_MINIMUM يحتاج override
+    throw err;
+  }
+};
+
+/**
+ * يتحقق من حد الائتمان للعميل (يُستخدم في finalize فقط).
+ */
+const validateCreditLimit = async (customer, newTotal) => {
+  if (!customer.creditLimit || customer.creditLimit <= 0) return;
+
+  const projected = round2((customer.currentBalance || 0) + newTotal);
+  if (projected > customer.creditLimit) {
     throw new AppError(
-      `تجاوز حد الائتمان. الرصيد: ${customer.currentBalance}، الحد: ${customer.creditLimit}`,
+      `تجاوز حد الائتمان. الحد: ${customer.creditLimit} SDG، المتوقع: ${projected} SDG`,
       400,
       'CREDIT_LIMIT_EXCEEDED'
     );
   }
+};
 
-  // ═══════════════════════════════════════════════
-  // 2. تحديد المخزن
-  // ═══════════════════════════════════════════════
-  let finalWarehouseId = warehouseId;
-  if (!finalWarehouseId) {
-    const defaultWarehouse = await Warehouse.findOne({ isDefault: true, isActive: true });
-    if (!defaultWarehouse) throw new AppError('لا يوجد مخزن افتراضي.', 400, 'NO_WAREHOUSE');
-    finalWarehouseId = defaultWarehouse._id;
+/**
+ * يُنشئ Commission + SalesRepTransaction عند الاعتماد.
+ */
+const createCommissionForInvoice = async (invoice, user) => {
+  if (!invoice.salesRep || !invoice.items?.length) return null;
+
+  const commissionDoc = await Commission.findOne({
+    salesRep: invoice.salesRep,
+    isActive: true,
+  }).lean();
+
+  if (!commissionDoc) return null;
+
+  let totalCommission = 0;
+
+  // baseCommission: نسبة أو مبلغ ثابت
+  const base = commissionDoc.baseCommission || {};
+  if (base.type === 'percentage') {
+    totalCommission += round2((invoice.subtotal * base.value) / 100);
+  } else if (base.type === 'fixed') {
+    totalCommission += round2(base.value || 0);
   }
 
-  // ═══════════════════════════════════════════════
-  // 3. ✅ التحقق من الأسعار (Phase 2.5)
-  // ═══════════════════════════════════════════════
-  const priceCheck = await validateInvoicePrices({
-    items: items.map((it) => ({ item: it.item, batch: it.batch, unitPrice: it.unitPrice, quantity: it.quantity })),
-    warehouseId: finalWarehouseId,
-    req,
+  // tiers: بونص متدرج على أساس المبيعات
+  if (Array.isArray(commissionDoc.tiers)) {
+    for (const tier of commissionDoc.tiers) {
+      if (invoice.subtotal >= tier.minAmount && invoice.subtotal < (tier.maxAmount || Infinity)) {
+        totalCommission += round2(tier.bonus || 0);
+        break;
+      }
+    }
+  }
+
+  if (totalCommission <= 0) return null;
+
+  const transaction = await SalesRepTransaction.create({
+    salesRep: invoice.salesRep,
+    type: 'commission',
+    amount: totalCommission,
+    direction: 'in',
+    description: `عمولة فاتورة ${invoice.invoiceNumber}`,
+    referenceType: 'Invoice',
+    referenceId: invoice._id,
+    transactionDate: new Date(),
+    createdBy: user?._id || null,
   });
 
-  // رفض أي سطر BLOCKED
-  const blockedItems = priceCheck.results.filter((r) => r.status === 'BLOCKED');
-  if (blockedItems.length > 0) {
-    const details = blockedItems.map((r) => `• ${r.batch}: ${r.message}`).join('\n');
-    throw new AppError(
-      `أسعار غير صالحة:\n${details}`,
-      400,
-      'INVALID_SALE_PRICE'
-    );
+  invoice.commission = {
+    amount: totalCommission,
+    transactionId: transaction._id,
+    calculatedAt: new Date(),
+  };
+  await invoice.save();
+
+  return transaction;
+};
+
+/* ─────────────────────────────────────────────────────────────
+ * 2) createInvoice — إنشاء فاتورة مباشرة (بلا مسودة)
+ * ─────────────────────────────────────────────────────────────
+ * @param {Object} params
+ * @param {Object} params.body
+ * @param {Object} params.user - req.user
+ * @param {Object} [params.scope] - req.scope
+ * @returns {Promise<Object>}
+ */
+export const createInvoice = async ({ body, user, scope }) => {
+  const {
+    pharmacy,
+    salesRep,
+    warehouse,
+    items,
+    discount = 0,
+    taxRate = 0,
+    paymentType,
+    dueDate,
+    totalInstallments,
+    paidAmount = 0,
+    paymentMethod,
+    overrideReason,
+    cashFundId,
+    bankAccountId,
+    deliveryNoteId,
+    notes,
+  } = body;
+
+  // ─── 1) التحقق من الصيدلية ───
+  if (!pharmacy) throw new AppError('الصيدلية مطلوبة', 400, 'MISSING_PHARMACY');
+  const customer = await Customer.findById(pharmacy);
+  if (!customer) throw new AppError('الصيدلية غير موجودة', 404, 'CUSTOMER_NOT_FOUND');
+  if (!customer.isActive) throw new AppError('الصيدلية غير نشطة', 403, 'CUSTOMER_INACTIVE');
+  if (customer.isBlocked) throw new AppError('الصيدلية محظورة', 403, 'CUSTOMER_BLOCKED');
+
+  // ─── 2) التحقق من المخزن ───
+  if (!warehouse) throw new AppError('المخزن مطلوب', 400, 'MISSING_WAREHOUSE');
+
+  // ─── 3) التحقق من نوع الدفع ───
+  if (!['cash', 'credit', 'installments'].includes(paymentType)) {
+    throw new AppError('نوع الدفع غير صحيح', 400, 'INVALID_PAYMENT_TYPE');
+  }
+  if (paymentType === 'credit' && !dueDate) {
+    throw new AppError('تاريخ الاستحقاق مطلوب للفاتورة الآجلة', 400, 'MISSING_DUE_DATE');
+  }
+  if (paymentType === 'installments' && (!totalInstallments || totalInstallments < 2)) {
+    throw new AppError('عدد الأقساط يجب أن يكون 2 على الأقل', 400, 'INVALID_INSTALLMENTS');
   }
 
-  // إذا تجاوز → نحتاج overrideReason
-  const hasOverride = priceCheck.needsOverride;
-  if (hasOverride && (!overrideReason || overrideReason.trim().length < 5)) {
-    throw new AppError(
-      'هذه الفاتورة تتضمن أسعاراً أقل من الحد الموصى به. يجب تحديد سبب التجاوز (5 أحرف على الأقل).',
-      400,
-      'OVERRIDE_REASON_REQUIRED'
-    );
+  // ─── 4) التحقق من الأسعار ───
+  await validateItemsPrices(items, { overrideReason, user });
+
+  // ─── 5) حساب المجاميع ───
+  const { subtotal, discountAmount, taxAmount, total } = calculateTotals(items, discount, taxRate);
+
+  // ─── 6) التحقق من حد الائتمان (إن آجل/أقساط) ───
+  if (paymentType !== 'cash') {
+    await validateCreditLimit(customer, total - paidAmount);
   }
 
-  // ═══════════════════════════════════════════════
-  // 4. ✅ فحص DeliveryNote (Phase 2.5 — إصلاح Bug)
-  // ═══════════════════════════════════════════════
-  let linkedDeliveryNote = null;
+  // ─── 7) فحص إيصال التسليم + خصم Stock ───
+  let issuedLots = [];
   if (deliveryNoteId) {
-    linkedDeliveryNote = await DeliveryNote.findById(deliveryNoteId);
-    if (!linkedDeliveryNote) {
-      throw new AppError('إيصال التسليم المرتبط غير موجود.', 404, 'DELIVERY_NOTE_NOT_FOUND');
-    }
-    if (String(linkedDeliveryNote.pharmacy) !== String(pharmacyId)) {
-      throw new AppError('إيصال التسليم لا يخص هذه الصيدلية.', 400, 'DELIVERY_NOTE_PHARMACY_MISMATCH');
-    }
-    if (linkedDeliveryNote.status !== 'delivered') {
-      throw new AppError('لا يمكن إصدار فاتورة لإيصال لم يُسلَّم بعد.', 400, 'DELIVERY_NOTE_NOT_DELIVERED');
-    }
-  }
-
-  // ═══════════════════════════════════════════════
-  // 5. خصم المخزون (Rollback)
-  // ⚠️ Phase 2.5: إذا مرتبط بإيصال → لا نخصم (مخصوم مسبقاً)
-  // ═══════════════════════════════════════════════
-  const issuedStockLog = [];
-  const invoiceItems = [];
-
-  if (linkedDeliveryNote) {
-    // ✅ لا خصم من Stock — البضاعة خرجت في إيصال التسليم
-    // نتحقق فقط أن الإيصال يحتوي على الأصناف المطلوبة
-    for (const line of items) {
-      const dnItem = linkedDeliveryNote.items.find(
-        (di) => String(di.item) === String(line.item) && di.batch === line.batch
-      );
-      if (!dnItem) {
-        throw new AppError(
-          `البند ${line.batch} غير موجود في إيصال التسليم ${linkedDeliveryNote.deliveryNumber}.`,
-          400,
-          'ITEM_NOT_IN_DELIVERY_NOTE'
-        );
-      }
-      if (line.quantity > dnItem.quantity + 0.01) {
-        throw new AppError(
-          `كمية البند ${line.batch} (${line.quantity}) تتجاوز كمية الإيصال (${dnItem.quantity}).`,
-          400,
-          'QUANTITY_EXCEEDS_DELIVERY_NOTE'
-        );
-      }
-      invoiceItems.push({
-        ...line,
-        unitCost: dnItem.unitPrice ? 0 : 0, // لا نعرف تكلفة البضاعة هنا (موجودة في Stock)
-      });
-    }
-    logger.info(`[createInvoice] لا خصم من Stock — الفاتورة مرتبطة بإيصال ${linkedDeliveryNote.deliveryNumber}.`);
+    // منع double-deduction: نتحقق فقط
+    await validateDeliveryNoteItems(deliveryNoteId, items);
+    // لا نخصم Stock — مخصوم في الإيصال
   } else {
-    // ✅ بيع مباشر — خصم Stock (كما كان)
+    // نخصم Stock عبر FEFO
     try {
-      for (const line of items) {
-        if (line.batch) {
-          const stock = await Stock.findOne({
-            item: line.item, batch: line.batch, warehouse: finalWarehouseId,
-            quantity: { $gte: line.quantity }, isQuarantined: false,
-          });
-
-          if (!stock) {
-            throw new AppError(`الدفعة ${line.batch} غير متوفرة أو الكمية غير كافية.`, 400, 'INSUFFICIENT_STOCK');
-          }
-
-          stock.quantity -= line.quantity;
-          stock.lastIssuedAt = new Date();
-          await stock.save();
-
-          issuedStockLog.push({ itemId: line.item, warehouseId: finalWarehouseId, batch: line.batch, quantity: line.quantity });
-          invoiceItems.push({ ...line, unitCost: stock.unitCost || 0 });
-        } else {
-          const issuedBatches = await issueStock({ itemId: line.item, warehouseId: finalWarehouseId, quantity: line.quantity });
-          for (const batch of issuedBatches) {
-            issuedStockLog.push({ itemId: line.item, warehouseId: finalWarehouseId, batch: batch.batch, quantity: batch.quantity });
-            invoiceItems.push({
-              item: line.item, batch: batch.batch, expiry: batch.expiry, quantity: batch.quantity,
-              unit: line.unit || '', unitPrice: line.unitPrice,
-              total: Math.round(batch.quantity * line.unitPrice * 100) / 100,
-              unitCost: batch.unitCost || 0,
-            });
-          }
-        }
-      }
-    } catch (error) {
-      logger.error(`فشل صرف المخزون: ${error.message}. Rollback...`);
-      for (const log of issuedStockLog) {
-        try { await returnStock({ itemId: log.itemId, warehouseId: log.warehouseId, batch: log.batch, quantity: log.quantity }); }
-        catch (rbErr) { logger.error(`فشل Rollback للدفعة ${log.batch}: ${rbErr.message}`); }
-      }
-      throw error;
+      issuedLots = await issueStock({
+        items: items.map((it) => ({
+          itemId: it.itemId,
+          warehouseId: warehouse,
+          quantity: it.quantity,
+          batch: it.batch, // إن محدد
+        })),
+        user,
+      });
+    } catch (err) {
+      throw new AppError(`فشل صرف المخزون: ${err.message}`, 400, 'STOCK_ISSUE_FAILED');
     }
   }
 
-  // ═══════════════════════════════════════════════
-  // 6. الحسابات والعمولة
-  // ═══════════════════════════════════════════════
-  const totals = calculateTotals(invoiceItems, discount, taxRate);
-  const commissionData = await calculateCommission(salesRepId, totals.total);
+  // ─── 8) حساب COGS ───
+  const costAmount = calculateIssuedCost(issuedLots);
+
+  // ─── 9) توليد رقم الفاتورة ───
   const invoiceNumber = await generateInvoiceNumber();
 
-  // ═══════════════════════════════════════════════
-  // 7. إنشاء الفاتورة
-  // ═══════════════════════════════════════════════
-  const invoice = await Invoice.create({
-    invoiceNumber,
-    deliveryNote: deliveryNoteId || null,
-    pharmacy: pharmacyId,
-    salesRep: salesRepId,
-    warehouse: finalWarehouseId,
-    invoiceDate: invoiceDate || new Date(),
-    items: invoiceItems,
-    subtotal: totals.subtotal,
-    discount: {
-      type: discount?.type || null, value: discount?.value || 0,
-      reason: discount?.reason || '', computedAmount: totals.discountAmount,
-      freeItems: discount?.freeItems || [],
-    },
-    taxRate: taxRate || 0, taxAmount: totals.taxAmount, total: totals.total,
-    paymentType, dueDate, totalInstallments: totalInstallments || 0,
-    paidAmount, remainingAmount: Math.max(0, totals.total - paidAmount),
-    paymentMethod: paymentMethod || '',
-    status: INVOICE_STATUSES.PENDING,
-    commission: { rate: commissionData.rate, amount: commissionData.amount, isPaid: false },
-    notes,
-    createdBy: req.user._id,
-    finalizedBy: req.user._id,
-    finalizedAt: new Date(),
-  });
-
-  // ═══════════════════════════════════════════════
-  // 8. رصيد الصيدلية
-  // ═══════════════════════════════════════════════
-  const creditAmount = totals.total - paidAmount;
-  if (creditAmount > 0) {
-    await Customer.updateOne({ _id: pharmacyId }, { $inc: { currentBalance: creditAmount } });
-  }
-
-  // ═══════════════════════════════════════════════
-  // 9. عمولة المندوب
-  // ═══════════════════════════════════════════════
-  if (commissionData.amount > 0) {
-    const commissionTx = await SalesRepTransaction.create({
-      transactionNumber: generateTransactionNumber('SRT'),
-      salesRep: salesRepId, type: 'commission', direction: 'credit',
-      amount: commissionData.amount,
-      description: `عمولة فاتورة ${invoiceNumber}`,
-      referenceType: 'Invoice', referenceId: invoice._id,
-      status: 'approved', createdBy: req.user._id,
+  // ─── 10) إنشاء الفاتورة ───
+  let invoice;
+  try {
+    invoice = await Invoice.create({
+      invoiceNumber,
+      pharmacy,
+      salesRep: salesRep || null,
+      warehouse,
+      items,
+      subtotal,
+      discountAmount,
+      taxRate,
+      taxAmount,
+      total,
+      paidAmount: round2(paidAmount),
+      paymentType,
+      dueDate: dueDate || null,
+      totalInstallments: totalInstallments || null,
+      paymentMethod: paymentMethod || null,
+      deliveryNote: deliveryNoteId || null,
+      status: 'pending',
+      notes,
+      createdBy: user?._id || null,
+      ...(overrideReason && { overrideReason, overrideBy: user?._id }),
     });
-    invoice.commission.transactionId = commissionTx._id;
-    await invoice.save();
+  } catch (err) {
+    // Rollback stock
+    if (issuedLots.length > 0) {
+      try {
+        await returnStock({ issuedLots, user });
+      } catch (rbErr) {
+        logger.error(`[invoiceService] فشل Rollback المخزون: ${rbErr.message}`);
+      }
+    }
+    throw err;
   }
 
-  // ═══════════════════════════════════════════════
-  // 10. حركة نقدية
-  // ═══════════════════════════════════════════════
-  if (paidAmount > 0) {
-    await CashTransaction.create({
-      transactionNumber: generateTransactionNumber('CT'),
-      accountType: 'cash', direction: 'in', category: 'sale_cash',
-      amount: paidAmount,
-      description: `دفعة أولى للفاتورة ${invoiceNumber}`,
-      referenceType: 'Invoice', referenceId: invoice._id,
-      party: pharmacyId, partyType: 'Customer',
-      createdBy: req.user._id,
-    });
+  // ─── 11) إنشاء القيود المحاسبية + الحركة النقدية ───
+  try {
+    const remaining = round2(total - paidAmount);
+
+    if (paidAmount > 0) {
+      // حركة نقدية (فقط إذا لم يكن من إيصال تسليم — الإيصال أنشأها)
+      if (!deliveryNoteId) {
+        await cashService.createCashTransaction({
+          direction: 'in',
+          amount: paidAmount,
+          method: paymentMethod || 'cash',
+          cashFundId: paymentMethod === 'cash' ? cashFundId : null,
+          bankAccountId: paymentMethod === 'bank' ? bankAccountId : null,
+          transactionDate: new Date(),
+          description: `دفعة فاتورة ${invoiceNumber}`,
+          referenceType: 'invoice',
+          referenceId: invoice._id,
+          user,
+          skipEntry: true, // سنُنشئ SALE_CASH يدوياً مع COGS
+        });
+      }
+
+      // SALE_CASH + COGS entry
+      await accountingService.createSaleCashEntry({
+        amount: paidAmount,
+        costAmount,
+        date: new Date(),
+        sourceType: 'Invoice',
+        sourceId: invoice._id,
+        cashFundId: paymentMethod === 'cash' ? cashFundId : null,
+        user,
+        description: `بيع نقدي — ${invoiceNumber}`,
+      });
+    }
+
+    if (remaining > 0 && paymentType !== 'cash') {
+      // SALE_CREDIT entry (بدون COGS لأنها سُجّلت أعلاه)
+      await accountingService.createSaleCreditEntry({
+        amount: remaining,
+        costAmount: paidAmount > 0 ? 0 : costAmount, // إذا لم يدفع شيء، COGS هنا
+        date: new Date(),
+        sourceType: 'Invoice',
+        sourceId: invoice._id,
+        user,
+        description: `بيع آجل — ${invoiceNumber}`,
+      });
+
+      // تحديث رصيد العميل
+      await Customer.updateOne(
+        { _id: pharmacy },
+        { $inc: { currentBalance: remaining } }
+      );
+    }
+
+    // إذا لم يدفع شيئاً وكان نقدياً (paidAmount=0, paymentType=cash) — نعتبرها آجلة
+    if (paidAmount === 0 && paymentType === 'cash') {
+      await accountingService.createSaleCreditEntry({
+        amount: total,
+        costAmount,
+        date: new Date(),
+        sourceType: 'Invoice',
+        sourceId: invoice._id,
+        user,
+        description: `بيع (لم يُدفع) — ${invoiceNumber}`,
+      });
+      await Customer.updateOne(
+        { _id: pharmacy },
+        { $inc: { currentBalance: total } }
+      );
+    }
+  } catch (err) {
+    // Rollback: حذف الفاتورة + إرجاع Stock
+    try {
+      await Invoice.deleteOne({ _id: invoice._id });
+      if (issuedLots.length > 0) {
+        await returnStock({ issuedLots, user });
+      }
+    } catch (rbErr) {
+      logger.error(`[invoiceService] Rollback فشل: ${rbErr.message}`);
+    }
+    throw err;
   }
 
-  // ═══════════════════════════════════════════════
-  // 11. Audit Log
-  // ═══════════════════════════════════════════════
+  // ─── 12) تحديث الحالة ───
+  if (paidAmount >= total - 0.01) invoice.status = 'paid';
+  else if (paidAmount > 0) invoice.status = 'partial';
+  else if (paymentType === 'cash') invoice.status = 'pending';
+  await invoice.save();
+
+  // ─── 13) Commission ───
+  await createCommissionForInvoice(invoice, user);
+
+  // ─── 14) Audit ───
   await logAuditEvent({
-    req,
-    action: hasOverride ? AUDIT_ACTIONS.UPDATE : AUDIT_ACTIONS.CREATE,
+    req: { user },
+    action: AUDIT_ACTIONS.CREATE,
     resource: 'Invoice',
     resourceId: invoice._id,
-    description: hasOverride
-      ? `إنشاء فاتورة ${invoiceNumber} (بتجاوز سعري): ${overrideReason}`
-      : `إنشاء فاتورة ${invoiceNumber} للصيدلية ${customer.name}`,
+    description: `إنشاء فاتورة ${invoiceNumber} — ${total} SDG`,
     success: true,
     meta: {
-      after: { invoiceNumber, total: totals.total, paidAmount, status: invoice.status },
-      override: hasOverride
-        ? { reason: overrideReason, items: priceCheck.results.filter((r) => r.status === 'WARN_OVERRIDE') }
-        : undefined,
+      after: invoice.toObject(),
+      override: overrideReason ? { reason: overrideReason, by: user?._id } : null,
     },
   });
 
-  // ═══════════════════════════════════════════════
-  // 12. ✅ تنبيه الأدمن (Phase 2.5)
-  // ═══════════════════════════════════════════════
-  if (hasOverride) {
-    await notifyAdminAboutPriceOverride({
-      invoice, overrideResults: priceCheck.results,
-      overrideReason, req,
-    });
-  }
+  logger.info(`[invoiceService] فاتورة ${invoiceNumber} — ${total} SDG`);
 
   return invoice;
-}
+};
 
-// ============================================================
-// 2) إنشاء مسودة
-// ============================================================
+/* ─────────────────────────────────────────────────────────────
+ * 3) createDraft — إنشاء مسودة (Phase 2.5)
+ * ─────────────────────────────────────────────────────────────
+ * لا حركة نقدية، لا قيد، لا stock، لا credit check.
+ */
+export const createDraft = async ({ body, user, scope }) => {
+  const { pharmacy, salesRep, warehouse, items, discount = 0, taxRate = 0, notes } = body;
 
-export async function createDraftInvoice({ data, req }) {
-  const {
-    pharmacy: pharmacyId, salesRep: salesRepId, deliveryNote,
-    warehouse: warehouseId, items, discount, taxRate, invoiceDate, notes,
-  } = data;
+  if (!pharmacy) throw new AppError('الصيدلية مطلوبة', 400, 'MISSING_PHARMACY');
+  const customer = await Customer.findById(pharmacy);
+  if (!customer) throw new AppError('الصيدلية غير موجودة', 404, 'CUSTOMER_NOT_FOUND');
+  if (!customer.isActive) throw new AppError('الصيدلية غير نشطة', 403, 'CUSTOMER_INACTIVE');
 
-  await ensureCustomerUsable(pharmacyId);
-  await ensureWarehouseActive(warehouseId);
+  if (!warehouse) throw new AppError('المخزن مطلوب في المسودة', 400, 'MISSING_WAREHOUSE');
+  if (!Array.isArray(items) || items.length === 0) {
+    throw new AppError('المسودة تحتاج بنداً واحداً على الأقل', 400, 'EMPTY_ITEMS');
+  }
 
-  // ⚠️ المسودة لا تُحقّق السعر (فقط عند الاعتماد)
-  const totals = calculateTotals(items, discount, taxRate);
+  const { subtotal, discountAmount, taxAmount, total } = calculateTotals(items, discount, taxRate);
   const invoiceNumber = await generateInvoiceNumber();
 
-  const invoice = await Invoice.create({
+  const draft = await Invoice.create({
     invoiceNumber,
-    deliveryNote: deliveryNote || null,
-    pharmacy: pharmacyId, salesRep: salesRepId, warehouse: warehouseId,
-    invoiceDate: invoiceDate || new Date(),
+    pharmacy,
+    salesRep: salesRep || null,
+    warehouse,
     items,
-    subtotal: totals.subtotal,
-    discount: {
-      type: discount?.type || null, value: discount?.value || 0,
-      reason: discount?.reason || '', computedAmount: totals.discountAmount,
-      freeItems: discount?.freeItems || [],
-    },
-    taxRate: taxRate || 0, taxAmount: totals.taxAmount, total: totals.total,
-    paidAmount: 0, remainingAmount: totals.total,
-    status: INVOICE_STATUSES.DRAFT,
-    commission: { rate: 0, amount: 0, isPaid: false },
-    notes, createdBy: req.user._id,
+    subtotal,
+    discountAmount,
+    taxRate,
+    taxAmount,
+    total,
+    paidAmount: 0,
+    paymentType: null,
+    status: 'draft',
+    notes,
+    createdBy: user?._id || null,
   });
 
   await logAuditEvent({
-    req, action: AUDIT_ACTIONS.CREATE, resource: 'Invoice', resourceId: invoice._id,
-    description: `إنشاء مسودة فاتورة ${invoiceNumber}`,
+    req: { user },
+    action: AUDIT_ACTIONS.CREATE,
+    resource: 'Invoice',
+    resourceId: draft._id,
+    description: `إنشاء مسودة ${invoiceNumber}`,
     success: true,
-    meta: { after: { invoiceNumber, total: totals.total, status: 'draft' } },
+    meta: { after: draft.toObject() },
   });
 
-  return invoice;
-}
+  return draft;
+};
 
-// ============================================================
-// 3) تعديل مسودة
-// ============================================================
-
-export async function updateDraftInvoice({ invoiceId, data, req }) {
+/* ─────────────────────────────────────────────────────────────
+ * 4) updateDraft — تعديل مسودة
+ * ─────────────────────────────────────────────────────────────
+ * pharmacy ثابت — لا يمكن تغييره.
+ */
+export const updateDraft = async ({ invoiceId, body, user, scope }) => {
   const invoice = await Invoice.findById(invoiceId);
-  if (!invoice) throw new AppError('الفاتورة غير موجودة.', 404, 'INVOICE_NOT_FOUND');
-  if (invoice.status !== INVOICE_STATUSES.DRAFT) {
-    throw new AppError('لا يمكن تعديل فاتورة غير مسودة.', 409, 'NOT_A_DRAFT');
+  if (!invoice) throw new AppError('الفاتورة غير موجودة', 404, 'INVOICE_NOT_FOUND');
+  if (invoice.status !== 'draft') {
+    throw new AppError('يمكن تعديل المسودات فقط', 400, 'NOT_A_DRAFT');
   }
-  if (data.warehouse) await ensureWarehouseActive(data.warehouse);
 
-  const before = { items: invoice.items, total: invoice.total };
+  const { items, discount, taxRate, notes, salesRep, warehouse } = body;
 
-  if (data.salesRep !== undefined) invoice.salesRep = data.salesRep;
-  if (data.deliveryNote !== undefined) invoice.deliveryNote = data.deliveryNote;
-  if (data.warehouse !== undefined) invoice.warehouse = data.warehouse;
-  if (data.invoiceDate !== undefined) invoice.invoiceDate = data.invoiceDate;
-  if (data.notes !== undefined) invoice.notes = data.notes;
+  // pharmacy ثابت — نرفض تغييره
+  if (body.pharmacy && String(body.pharmacy) !== String(invoice.pharmacy)) {
+    throw new AppError('لا يمكن تغيير الصيدلية بعد الإنشاء', 400, 'PHARMACY_IMMUTABLE');
+  }
 
-  if (data.items || data.discount !== undefined || data.taxRate !== undefined) {
-    const newItems = data.items || invoice.items;
-    const newDiscount = data.discount !== undefined ? data.discount : invoice.discount;
-    const newTaxRate = data.taxRate !== undefined ? data.taxRate : invoice.taxRate;
-    const totals = calculateTotals(newItems, newDiscount, newTaxRate);
-    invoice.items = newItems;
-    invoice.subtotal = totals.subtotal;
-    invoice.discount = {
-      type: newDiscount?.type || null, value: newDiscount?.value || 0,
-      reason: newDiscount?.reason || '', computedAmount: totals.discountAmount,
-      freeItems: newDiscount?.freeItems || [],
-    };
-    invoice.taxRate = newTaxRate;
-    invoice.taxAmount = totals.taxAmount;
-    invoice.total = totals.total;
-    invoice.remainingAmount = totals.total;
+  if (warehouse) invoice.warehouse = warehouse;
+  if (salesRep !== undefined) invoice.salesRep = salesRep;
+  if (notes !== undefined) invoice.notes = notes;
+
+  if (items) {
+    if (!Array.isArray(items) || items.length === 0) {
+      throw new AppError('المسودة تحتاج بنداً واحداً على الأقل', 400, 'EMPTY_ITEMS');
+    }
+    invoice.items = items;
+    const { subtotal, discountAmount, taxAmount, total } = calculateTotals(items, discount, taxRate);
+    invoice.subtotal = subtotal;
+    invoice.discountAmount = discountAmount;
+    invoice.taxRate = taxRate || 0;
+    invoice.taxAmount = taxAmount;
+    invoice.total = total;
   }
 
   await invoice.save();
 
   await logAuditEvent({
-    req, action: AUDIT_ACTIONS.UPDATE, resource: 'Invoice', resourceId: invoice._id,
-    description: `تعديل مسودة الفاتورة ${invoice.invoiceNumber}`,
+    req: { user },
+    action: AUDIT_ACTIONS.UPDATE,
+    resource: 'Invoice',
+    resourceId: invoice._id,
+    description: `تعديل مسودة ${invoice.invoiceNumber}`,
     success: true,
-    meta: { before, after: { total: invoice.total } },
+    meta: { after: invoice.toObject() },
   });
 
   return invoice;
-}
+};
 
-// ============================================================
-// 4) اعتماد مسودة (مُصلح Bug + تقييد سعر)
-// ============================================================
-
-export async function finalizeInvoice({ invoiceId, data, req }) {
+/* ─────────────────────────────────────────────────────────────
+ * 5) finalizeInvoice — اعتماد مسودة (Phase 2.5 + 3)
+ * ─────────────────────────────────────────────────────────────
+ * هذا هو الحدث الذي "يفعّل" كل شيء:
+ *  - فحص الائتمان
+ *  - خصم Stock (إلا إذا deliveryNote)
+ *  - CashTransaction
+ *  - AccountingEntry
+ *  - Commission
+ *  - تحديث رصيد العميل
+ */
+export const finalizeInvoice = async ({ invoiceId, body, user, scope }) => {
   const invoice = await Invoice.findById(invoiceId);
-  if (!invoice) throw new AppError('الفاتورة غير موجودة.', 404, 'INVOICE_NOT_FOUND');
-  if (invoice.status !== INVOICE_STATUSES.DRAFT) {
-    throw new AppError('الفاتورة ليست مسودة.', 409, 'NOT_A_DRAFT');
-  }
-  if (!invoice.warehouse) throw new AppError('المسودة بدون مخزن.', 400, 'NO_WAREHOUSE');
-
-  const { paymentType, dueDate, totalInstallments, paidAmount, paymentMethod, notes, overrideReason } = data;
-
-  // 1. التحقق من الائتمان
-  const customer = await ensureCustomerUsable(invoice.pharmacy);
-  const creditAmount = invoice.total - (paidAmount || 0);
-  if (paymentType !== 'cash' && customer.wouldExceedCredit(creditAmount)) {
-    throw new AppError(
-      `تجاوز حد الائتمان. الرصيد: ${customer.currentBalance}، الحد: ${customer.creditLimit}`,
-      400,
-      'CREDIT_LIMIT_EXCEEDED'
-    );
+  if (!invoice) throw new AppError('الفاتورة غير موجودة', 404, 'INVOICE_NOT_FOUND');
+  if (invoice.status !== 'draft') {
+    throw new AppError('يمكن اعتماد المسودات فقط', 400, 'NOT_A_DRAFT');
   }
 
-  // 2. ✅ التحقق من الأسعار (Phase 2.5)
-  const priceCheck = await validateInvoicePrices({
-    items: invoice.items.map((it) => ({ item: it.item, batch: it.batch, unitPrice: it.unitPrice, quantity: it.quantity })),
-    warehouseId: invoice.warehouse,
-    req,
-  });
+  const {
+    paymentType,
+    dueDate,
+    totalInstallments,
+    paidAmount = 0,
+    paymentMethod,
+    overrideReason,
+    cashFundId,
+    bankAccountId,
+  } = body;
 
-  const blockedItems = priceCheck.results.filter((r) => r.status === 'BLOCKED');
-  if (blockedItems.length > 0) {
-    const details = blockedItems.map((r) => `• ${r.batch}: ${r.message}`).join('\n');
-    throw new AppError(`أسعار غير صالحة:\n${details}`, 400, 'INVALID_SALE_PRICE');
+  // ─── 1) التحقق ───
+  if (!['cash', 'credit', 'installments'].includes(paymentType)) {
+    throw new AppError('نوع الدفع غير صحيح', 400, 'INVALID_PAYMENT_TYPE');
+  }
+  if (paymentType === 'credit' && !dueDate) {
+    throw new AppError('تاريخ الاستحقاق مطلوب', 400, 'MISSING_DUE_DATE');
+  }
+  if (paymentType === 'installments' && (!totalInstallments || totalInstallments < 2)) {
+    throw new AppError('عدد الأقساط يجب أن يكون 2 على الأقل', 400, 'INVALID_INSTALLMENTS');
   }
 
-  const hasOverride = priceCheck.needsOverride;
-  if (hasOverride && (!overrideReason || overrideReason.trim().length < 5)) {
-    throw new AppError(
-      'هذه الفاتورة تتضمن أسعاراً أقل من الحد الموصى به. يجب تحديد سبب التجاوز.',
-      400,
-      'OVERRIDE_REASON_REQUIRED'
-    );
+  // ─── 2) التحقق من حد الائتمان ───
+  const customer = await Customer.findById(invoice.pharmacy);
+  if (paymentType !== 'cash') {
+    await validateCreditLimit(customer, invoice.total - paidAmount);
   }
 
-  // 3. ✅ فحص DeliveryNote
-  let linkedDeliveryNote = null;
+  // ─── 3) التحقق من الأسعار (مع overrideReason إن وُجد) ───
+  await validateItemsPrices(invoice.items, { overrideReason, user });
+
+  // ─── 4) خصم Stock (إلا إذا deliveryNote) ───
+  let issuedLots = [];
   if (invoice.deliveryNote) {
-    linkedDeliveryNote = await DeliveryNote.findById(invoice.deliveryNote);
-  }
-
-  // 4. خصم Stock (Rollback) — فقط إن لم يكن مرتبطاً بإيصال
-  const issuedStockLog = [];
-
-  if (linkedDeliveryNote) {
-    // ✅ لا خصم (مخصوم في الإيصال)
-    logger.info(`[finalize] لا خصم Stock — الفاتورة مرتبطة بإيصال ${linkedDeliveryNote.deliveryNumber}.`);
+    await validateDeliveryNoteItems(invoice.deliveryNote, invoice.items);
   } else {
     try {
-      for (const item of invoice.items) {
-        const result = await Stock.updateOne(
-          { item: item.item, batch: item.batch, warehouse: invoice.warehouse, quantity: { $gte: item.quantity }, isQuarantined: false },
-          { $inc: { quantity: -item.quantity }, $set: { lastIssuedAt: new Date() } }
-        );
-        if (result.modifiedCount !== 1) {
-          throw new AppError(`الدفعة ${item.batch} غير متوفرة أو الكمية غير كافية.`, 400, 'INSUFFICIENT_STOCK');
-        }
-        issuedStockLog.push({ itemId: item.item, batch: item.batch, warehouseId: invoice.warehouse, quantity: item.quantity });
-      }
-    } catch (error) {
-      for (const log of issuedStockLog) {
-        try { await Stock.updateOne({ item: log.itemId, batch: log.batch, warehouse: log.warehouseId }, { $inc: { quantity: log.quantity } }); }
-        catch (rbErr) { logger.error(`Rollback: ${rbErr.message}`); }
-      }
-      throw error;
+      issuedLots = await issueStock({
+        items: invoice.items.map((it) => ({
+          itemId: it.itemId,
+          warehouseId: invoice.warehouse,
+          quantity: it.quantity,
+          batch: it.batch,
+        })),
+        user,
+      });
+    } catch (err) {
+      throw new AppError(`فشل صرف المخزون: ${err.message}`, 400, 'STOCK_ISSUE_FAILED');
     }
   }
 
-  // 5. العمولة
-  const commissionData = await calculateCommission(invoice.salesRep, invoice.total);
+  const costAmount = calculateIssuedCost(issuedLots);
 
-  // 6. تحديث الفاتورة
+  // ─── 5) تحديث الفاتورة ───
   invoice.paymentType = paymentType;
   invoice.dueDate = dueDate || null;
-  invoice.totalInstallments = totalInstallments || 0;
-  invoice.paidAmount = paidAmount || 0;
-  invoice.remainingAmount = Math.max(0, invoice.total - (paidAmount || 0));
-  invoice.paymentMethod = paymentMethod || '';
-  invoice.commission = { rate: commissionData.rate, amount: commissionData.amount, isPaid: false };
-  invoice.status = INVOICE_STATUSES.PENDING;
-  invoice.finalizedBy = req.user._id;
+  invoice.totalInstallments = totalInstallments || null;
+  invoice.paidAmount = round2(paidAmount);
+  invoice.paymentMethod = paymentMethod || null;
+  invoice.finalizedBy = user?._id || null;
   invoice.finalizedAt = new Date();
-  if (notes) invoice.notes = notes;
+  if (overrideReason) {
+    invoice.overrideReason = overrideReason;
+    invoice.overrideBy = user?._id || null;
+  }
   await invoice.save();
 
-  // 7. رصيد + عمولة
-  if (creditAmount > 0) {
-    await Customer.updateOne({ _id: invoice.pharmacy }, { $inc: { currentBalance: creditAmount } });
-  }
-  if (commissionData.amount > 0) {
-    const commissionTx = await SalesRepTransaction.create({
-      transactionNumber: generateTransactionNumber('SRT'),
-      salesRep: invoice.salesRep, type: 'commission', direction: 'credit',
-      amount: commissionData.amount,
-      description: `عمولة فاتورة ${invoice.invoiceNumber}`,
-      referenceType: 'Invoice', referenceId: invoice._id,
-      status: 'approved', createdBy: req.user._id,
-    });
-    invoice.commission.transactionId = commissionTx._id;
-    await invoice.save();
-  }
+  // ─── 6) القيود + الحركة النقدية ───
+  try {
+    const remaining = round2(invoice.total - paidAmount);
 
-  // 8. CashTransaction
-  if (paidAmount > 0) {
-    await CashTransaction.create({
-      transactionNumber: generateTransactionNumber('CT'),
-      accountType: 'cash', direction: 'in', category: 'sale_cash',
-      amount: paidAmount,
-      description: `دفعة على اعتماد الفاتورة ${invoice.invoiceNumber}`,
-      referenceType: 'Invoice', referenceId: invoice._id,
-      party: invoice.pharmacy, partyType: 'Customer',
-      createdBy: req.user._id,
-    });
-  }
-
-  // 9. Audit
-  await logAuditEvent({
-    req,
-    action: hasOverride ? AUDIT_ACTIONS.UPDATE : AUDIT_ACTIONS.UPDATE,
-    resource: 'Invoice', resourceId: invoice._id,
-    description: hasOverride
-      ? `اعتماد مسودة ${invoice.invoiceNumber} (بتجاوز سعري): ${overrideReason}`
-      : `اعتماد مسودة الفاتورة ${invoice.invoiceNumber}`,
-    success: true,
-    meta: { after: { status: invoice.status, total: invoice.total } },
-  });
-
-  // 10. تنبيه الأدمن
-  if (hasOverride) {
-    await notifyAdminAboutPriceOverride({
-      invoice, overrideResults: priceCheck.results,
-      overrideReason, req,
-    });
-  }
-
-  return invoice;
-}
-
-// ============================================================
-// 5) إلغاء (لم يتغير)
-// ============================================================
-
-export async function cancelInvoice({ invoiceId, cancelReason, req }) {
-  const invoice = await Invoice.findById(invoiceId);
-  if (!invoice) throw new AppError('الفاتورة غير موجودة.', 404, 'INVOICE_NOT_FOUND');
-  if (invoice.status === INVOICE_STATUSES.CANCELLED) {
-    throw new AppError('الفاتورة ملغاة بالفعل.', 409, 'INVOICE_ALREADY_CANCELLED');
-  }
-
-  // مسودة → إلغاء بسيط
-  if (invoice.status === INVOICE_STATUSES.DRAFT) {
-    invoice.status = INVOICE_STATUSES.CANCELLED;
-    invoice.cancelledAt = new Date();
-    invoice.cancelledBy = req.user._id;
-    invoice.cancelReason = cancelReason;
-    await invoice.save();
-    await logAuditEvent({ req, action: AUDIT_ACTIONS.DELETE, resource: 'Invoice', resourceId: invoice._id, description: `إلغاء مسودة ${invoice.invoiceNumber}: ${cancelReason}`, success: true });
-    return invoice;
-  }
-
-  if (invoice.paidAmount > 0) {
-    throw new AppError('لا يمكن إلغاء فاتورة عليها دفعات.', 409, 'INVOICE_HAS_PAYMENTS');
-  }
-
-  // ⚠️ Phase 2.5: إذا مرتبطة بـ DeliveryNote → لا نُرجع Stock (البضاعة خرجت بالفعل)
-  if (!invoice.deliveryNote) {
-    const warehouseId = invoice.warehouse || (await Warehouse.findOne({ isDefault: true }))._id;
-    for (const item of invoice.items) {
-      await returnStock({
-        itemId: item.item, warehouseId, batch: item.batch, quantity: item.quantity,
-        meta: { expiry: item.expiry, unitCost: item.unitCost, unitPrice: item.unitPrice, notes: `إرجاع - إلغاء ${invoice.invoiceNumber}` },
+    if (paidAmount > 0) {
+      if (!invoice.deliveryNote) {
+        await cashService.createCashTransaction({
+          direction: 'in',
+          amount: paidAmount,
+          method: paymentMethod || 'cash',
+          cashFundId: paymentMethod === 'cash' ? cashFundId : null,
+          bankAccountId: paymentMethod === 'bank' ? bankAccountId : null,
+          transactionDate: new Date(),
+          description: `دفعة فاتورة ${invoice.invoiceNumber}`,
+          referenceType: 'invoice',
+          referenceId: invoice._id,
+          user,
+          skipEntry: true,
+        });
+      }
+      await accountingService.createSaleCashEntry({
+        amount: paidAmount,
+        costAmount,
+        date: new Date(),
+        sourceType: 'Invoice',
+        sourceId: invoice._id,
+        cashFundId: paymentMethod === 'cash' ? cashFundId : null,
+        user,
+        description: `بيع نقدي — ${invoice.invoiceNumber}`,
       });
     }
-  } else {
-    logger.info(`[cancelInvoice] لا إرجاع Stock — الفاتورة مرتبطة بإيصال.`);
+
+    if (remaining > 0 && paymentType !== 'cash') {
+      await accountingService.createSaleCreditEntry({
+        amount: remaining,
+        costAmount: paidAmount > 0 ? 0 : costAmount,
+        date: new Date(),
+        sourceType: 'Invoice',
+        sourceId: invoice._id,
+        user,
+        description: `بيع آجل — ${invoice.invoiceNumber}`,
+      });
+      await Customer.updateOne(
+        { _id: invoice.pharmacy },
+        { $inc: { currentBalance: remaining } }
+      );
+    }
+
+    if (paidAmount === 0 && paymentType === 'cash') {
+      await accountingService.createSaleCreditEntry({
+        amount: invoice.total,
+        costAmount,
+        date: new Date(),
+        sourceType: 'Invoice',
+        sourceId: invoice._id,
+        user,
+        description: `بيع (لم يُدفع) — ${invoice.invoiceNumber}`,
+      });
+      await Customer.updateOne(
+        { _id: invoice.pharmacy },
+        { $inc: { currentBalance: invoice.total } }
+      );
+    }
+  } catch (err) {
+    // Rollback: نرجع الحالة draft + نرجع Stock
+    invoice.status = 'draft';
+    await invoice.save();
+    if (issuedLots.length > 0) {
+      try { await returnStock({ issuedLots, user }); } catch (_) {}
+    }
+    throw err;
   }
 
-  const creditAmount = invoice.total - invoice.paidAmount;
-  if (creditAmount > 0) {
-    await Customer.updateOne({ _id: invoice.pharmacy }, { $inc: { currentBalance: -creditAmount } });
-  }
-
-  await SalesRepTransaction.updateOne(
-    { referenceType: 'Invoice', referenceId: invoice._id, type: 'commission' },
-    { status: 'cancelled', cancelReason: 'إلغاء الفاتورة' }
-  );
-
-  invoice.status = INVOICE_STATUSES.CANCELLED;
-  invoice.cancelledAt = new Date();
-  invoice.cancelledBy = req.user._id;
-  invoice.cancelReason = cancelReason;
+  // ─── 7) تحديث الحالة ───
+  if (paidAmount >= invoice.total - 0.01) invoice.status = 'paid';
+  else if (paidAmount > 0) invoice.status = 'partial';
+  else invoice.status = 'pending';
   await invoice.save();
 
-  await logAuditEvent({ req, action: AUDIT_ACTIONS.DELETE, resource: 'Invoice', resourceId: invoice._id, description: `إلغاء ${invoice.invoiceNumber}: ${cancelReason}`, success: true });
-  return invoice;
-}
+  // ─── 8) Commission ───
+  await createCommissionForInvoice(invoice, user);
 
-// ============================================================
-// 6) تسجيل دفعة
-// ============================================================
-
-export async function registerPayment({ invoiceId, paymentData, req }) {
-  const invoice = await Invoice.findById(invoiceId);
-  if (!invoice) throw new AppError('الفاتورة غير موجودة.', 404, 'INVOICE_NOT_FOUND');
-  if (invoice.status === INVOICE_STATUSES.DRAFT) throw new AppError('لا يمكن دفع مسودة.', 409, 'INVOICE_IS_DRAFT');
-  if (invoice.status === INVOICE_STATUSES.CANCELLED) throw new AppError('لا يمكن دفع فاتورة ملغاة.', 409, 'INVOICE_CANCELLED');
-  if (invoice.remainingAmount <= 0) throw new AppError('الفاتورة مدفوعة بالكامل.', 409, 'INVOICE_ALREADY_PAID');
-
-  const { amount, paymentMethod } = paymentData;
-  if (amount > invoice.remainingAmount + 0.01) {
-    throw new AppError(`المبلغ يتجاوز المتبقي (${invoice.remainingAmount}).`, 400, 'AMOUNT_EXCEEDS_REMAINING');
-  }
-
-  await CashTransaction.create({
-    transactionNumber: generateTransactionNumber('CT'),
-    accountType: paymentMethod === 'bank' ? 'bank' : 'cash',
-    direction: 'in', category: 'customer_payment', amount,
-    description: `دفعة على الفاتورة ${invoice.invoiceNumber}`,
-    referenceType: 'Invoice', referenceId: invoice._id,
-    party: invoice.pharmacy, partyType: 'Customer',
-    createdBy: req.user._id,
+  // ─── 9) Audit ───
+  await logAuditEvent({
+    req: { user },
+    action: AUDIT_ACTIONS.UPDATE,
+    resource: 'Invoice',
+    resourceId: invoice._id,
+    description: `اعتماد فاتورة ${invoice.invoiceNumber}`,
+    success: true,
+    meta: { after: invoice.toObject() },
   });
 
-  invoice.registerPayment(amount);
+  return invoice;
+};
+
+/* ─────────────────────────────────────────────────────────────
+ * 6) registerPayment — دفعة على فاتورة قائمة
+ * ─────────────────────────────────────────────────────────────
+ */
+export const registerPayment = async ({
+  invoiceId,
+  amount,
+  paymentMethod,
+  cashFundId,
+  bankAccountId,
+  user,
+  scope,
+}) => {
+  const invoice = await Invoice.findById(invoiceId);
+  if (!invoice) throw new AppError('الفاتورة غير موجودة', 404, 'INVOICE_NOT_FOUND');
+  if (invoice.status === 'draft') {
+    throw new AppError('لا يمكن الدفع على مسودة', 409, 'INVOICE_IS_DRAFT');
+  }
+  if (invoice.status === 'cancelled') {
+    throw new AppError('الفاتورة ملغاة', 409, 'INVOICE_CANCELLED');
+  }
+  if (invoice.status === 'paid') {
+    throw new AppError('الفاتورة مدفوعة بالكامل', 409, 'INVOICE_ALREADY_PAID');
+  }
+
+  const remaining = round2(invoice.total - invoice.paidAmount);
+  if (amount > remaining + 0.01) {
+    throw new AppError(
+      `المبلغ يتجاوز المتبقي (${remaining} SDG)`,
+      400,
+      'AMOUNT_EXCEEDS_REMAINING'
+    );
+  }
+
+  // ─── 1) CashTransaction + CUSTOMER_PAYMENT entry ───
+  await cashService.createCashTransaction({
+    direction: 'in',
+    amount,
+    method: paymentMethod || 'cash',
+    cashFundId: paymentMethod === 'cash' ? cashFundId : null,
+    bankAccountId: paymentMethod === 'bank' ? bankAccountId : null,
+    transactionDate: new Date(),
+    description: `دفعة على فاتورة ${invoice.invoiceNumber}`,
+    referenceType: 'invoice',
+    referenceId: invoice._id,
+    user,
+    skipEntry: true,
+  });
+
+  await accountingService.createCustomerPaymentEntry({
+    amount,
+    paymentMethod: paymentMethod || 'cash',
+    date: new Date(),
+    sourceType: 'Invoice',
+    sourceId: invoice._id,
+    cashFundId: paymentMethod === 'cash' ? cashFundId : null,
+    bankAccountId: paymentMethod === 'bank' ? bankAccountId : null,
+    user,
+    description: `تحصيل دفعة — ${invoice.invoiceNumber}`,
+  });
+
+  // ─── 2) تحديث الفاتورة ───
+  invoice.paidAmount = round2(invoice.paidAmount + amount);
+  if (invoice.paidAmount >= invoice.total - 0.01) {
+    invoice.status = 'paid';
+  } else {
+    invoice.status = 'partial';
+  }
   await invoice.save();
 
-  await Customer.updateOne({ _id: invoice.pharmacy }, { $inc: { currentBalance: -amount } });
+  // ─── 3) تحديث رصيد العميل ───
+  await Customer.updateOne(
+    { _id: invoice.pharmacy },
+    { $inc: { currentBalance: -amount } }
+  );
 
-  await logAuditEvent({ req, action: AUDIT_ACTIONS.UPDATE, resource: 'Invoice', resourceId: invoice._id, description: `تسجيل دفعة ${amount} على ${invoice.invoiceNumber}`, success: true });
+  // ─── 4) Audit ───
+  await logAuditEvent({
+    req: { user },
+    action: AUDIT_ACTIONS.UPDATE,
+    resource: 'Invoice',
+    resourceId: invoice._id,
+    description: `دفعة ${amount} SDG على ${invoice.invoiceNumber}`,
+    success: true,
+  });
 
   return invoice;
-}
+};
+
+/* ─────────────────────────────────────────────────────────────
+ * 7) cancelInvoice — إلغاء فاتورة
+ * ─────────────────────────────────────────────────────────────
+ * - إذا كانت مدفوعة (paidAmount > 0): منع الإلغاء (استخدم مرتجع بدلاً)
+ * - إذا كانت draft: حذف بسيط
+ * - إذا كانت pending/partial: عكس Stock + عكس القيود
+ */
+export const cancelInvoice = async ({ invoiceId, reason, user, scope }) => {
+  const invoice = await Invoice.findById(invoiceId);
+  if (!invoice) throw new AppError('الفاتورة غير موجودة', 404, 'INVOICE_NOT_FOUND');
+  if (invoice.status === 'cancelled') {
+    throw new AppError('الفاتورة ملغاة مسبقاً', 409, 'ALREADY_CANCELLED');
+  }
+  if (invoice.paidAmount > 0) {
+    throw new AppError(
+      'لا يمكن إلغاء فاتورة مدفوعة — استخدم مرتجع بيع بدلاً',
+      409,
+      'INVOICE_HAS_PAYMENTS'
+    );
+  }
+
+  // ─── 1) عكس Stock (إلا إذا deliveryNote) ───
+  if (!invoice.deliveryNote && invoice.items?.length > 0) {
+    try {
+      // نرجع المخزون عبر returnStock (upsert)
+      await returnStock({
+        issuedLots: invoice.items.map((it) => ({
+          itemId: it.itemId,
+          warehouseId: invoice.warehouse,
+          batch: it.batch,
+          quantity: it.quantity,
+          unitCost: it.unitCost || 0,
+        })),
+        user,
+      });
+    } catch (err) {
+      logger.warn(`[invoiceService] فشل إرجاع Stock: ${err.message}`);
+    }
+  }
+
+  // ─── 2) عكس رصيد العميل (إن آجل/أقساط) ───
+  const remaining = round2(invoice.total - invoice.paidAmount);
+  if (remaining > 0 && invoice.paymentType !== 'cash') {
+    await Customer.updateOne(
+      { _id: invoice.pharmacy },
+      { $inc: { currentBalance: -remaining } }
+    );
+  }
+
+  // ─── 3) عكس القيود ───
+  try {
+    const entries = await accountingService.getEntriesBySource({
+      sourceType: 'Invoice',
+      sourceId: invoice._id,
+    });
+    for (const entry of entries) {
+      await accountingService.reverseEntry({
+        entryId: entry._id,
+        user,
+        reason: `إلغاء فاتورة ${invoice.invoiceNumber}: ${reason || ''}`.trim(),
+      });
+    }
+  } catch (err) {
+    logger.warn(`[invoiceService] فشل عكس قيود الفاتورة: ${err.message}`);
+  }
+
+  // ─── 4) تحديث الحالة ───
+  invoice.status = 'cancelled';
+  invoice.cancelledAt = new Date();
+  invoice.cancelledBy = user?._id || null;
+  invoice.cancelReason = reason || '';
+  await invoice.save();
+
+  // ─── 5) Audit ───
+  await logAuditEvent({
+    req: { user },
+    action: AUDIT_ACTIONS.UPDATE,
+    resource: 'Invoice',
+    resourceId: invoice._id,
+    description: `إلغاء فاتورة ${invoice.invoiceNumber} — ${reason || ''}`,
+    success: true,
+  });
+
+  return invoice;
+};
 
 export default {
-  createInvoice, createDraftInvoice, updateDraftInvoice,
-  finalizeInvoice, cancelInvoice, registerPayment,
+  createInvoice,
+  createDraft,
+  updateDraft,
+  finalizeInvoice,
+  registerPayment,
+  cancelInvoice,
 };

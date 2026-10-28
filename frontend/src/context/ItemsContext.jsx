@@ -1,9 +1,15 @@
 /**
  * @file ItemsContext.jsx
  * @description Context API لإدارة حالة الأصناف.
+ *
+ * يُصدّر:
+ *  - ItemsContext
+ *  - ItemsProvider
+ *  - useItems (✅ جديد)
+ *  - useItemsContext (✅ alias)
  */
 
-import { createContext, useCallback, useMemo, useState } from 'react';
+import { createContext, useCallback, useContext, useMemo, useState } from 'react';
 
 import * as itemsAPI from '../api/itemsAPI.js';
 
@@ -85,13 +91,9 @@ export function ItemsProvider({ children }) {
     }
   }, []);
 
-    // ═══════════════════════════════════════════════
-  // إعادة تفعيل صنف معطّل
-  // ═══════════════════════════════════════════════
   const reactivateItem = useCallback(async (id) => {
     setLoading(true);
     setError(null);
-
     try {
       const updated = await itemsAPI.updateItem(id, { isActive: true });
       setItems((prev) => prev.map((i) => (i.id === id ? updated : i)));
@@ -109,11 +111,26 @@ export function ItemsProvider({ children }) {
   const value = useMemo(
     () => ({
       items, pagination, loading, error,
-      fetchItems, createItem, updateItem, deleteItem,reactivateItem,
+      fetchItems, createItem, updateItem, deleteItem, reactivateItem,
       resetError: () => setError(null),
     }),
-    [items, pagination, loading, error, fetchItems, createItem, updateItem, deleteItem, reactivateItem,]
+    [items, pagination, loading, error, fetchItems, createItem, updateItem, deleteItem, reactivateItem]
   );
 
   return <ItemsContext.Provider value={value}>{children}</ItemsContext.Provider>;
 }
+
+/* ═══════════════════════════════════════════════════════════════
+ * Hooks
+ * ═══════════════════════════════════════════════════════════════ */
+
+export function useItems() {
+  const ctx = useContext(ItemsContext);
+  if (!ctx) {
+    throw new Error('useItems must be used within ItemsProvider');
+  }
+  return ctx;
+}
+
+// ✅ Alias للتوافق
+export const useItemsContext = useItems;

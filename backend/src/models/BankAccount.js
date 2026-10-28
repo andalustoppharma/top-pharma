@@ -4,9 +4,10 @@
  * نموذج الحساب البنكي (متطلب صريح: حساب بنكي واحد فقط).
  *
  * لماذا هذا الملف؟
- * - النظام يدعم حساباً بنكياً واحداً فقط (متطلب صريح).
+ * - النظام يدعم حساباً بنكياً واحداً فقط.
  * - نُفرض ذلك عبر unique index جزئي على isActive=true.
- * - الرصيد الحالي يُحدَّث من CashTransaction (نوع bank).
+ * - الرصيد الحالي (currentBalance) يُحدَّث من CashTransaction (نوع bank).
+ * - virtuals للتوافق: balance / accountName / branch / description.
  */
 
 import mongoose from 'mongoose';
@@ -20,6 +21,7 @@ const bankAccountSchema = new Schema(
   {
     /**
      * اسم الحساب (مثال: الحساب الرئيسي — بنك الخرطوم).
+     * يُقرأ في الواجهة عبر virtual accountName.
      */
     name: {
       type: String,
@@ -60,10 +62,21 @@ const bankAccountSchema = new Schema(
 
     /**
      * اسم الفرع.
+     * يُقرأ في الواجهة عبر virtual branch.
      */
     branchName: {
       type: String,
       trim: true,
+      default: '',
+    },
+
+    /**
+     * SWIFT (اختياري).
+     */
+    swift: {
+      type: String,
+      trim: true,
+      uppercase: true,
       default: '',
     },
 
@@ -77,7 +90,8 @@ const bankAccountSchema = new Schema(
     },
 
     /**
-     * الرصيد الحالي.
+     * الرصيد الحالي — الحقل الفعلي في قاعدة البيانات.
+     * يُحدَّث عبر $inc: { currentBalance: delta } في cashService.
      */
     currentBalance: {
       type: Number,
@@ -134,6 +148,54 @@ const bankAccountSchema = new Schema(
   }
 );
 
+/* ─────────────────────────────────────────────────────────────
+ * Virtuals — توافق مع الكود القديم
+ * ───────────────────────────────────────────────────────────── */
+
+bankAccountSchema
+  .virtual('balance')
+  .get(function getBalance() {
+    return this.currentBalance;
+  })
+  .set(function setBalance(v) {
+    this.currentBalance = v;
+  });
+
+bankAccountSchema
+  .virtual('accountName')
+  .get(function getAccountName() {
+    return this.name;
+  })
+  .set(function setAccountName(v) {
+    this.name = v;
+  });
+
+bankAccountSchema
+  .virtual('branch')
+  .get(function getBranch() {
+    return this.branchName;
+  })
+  .set(function setBranch(v) {
+    this.branchName = v;
+  });
+
+bankAccountSchema
+  .virtual('description')
+  .get(function getDescription() {
+    return this.notes || '';
+  })
+  .set(function setDescription(v) {
+    this.notes = v || '';
+  });
+
+// تفعيل virtuals
+bankAccountSchema.set('toJSON', { virtuals: true });
+bankAccountSchema.set('toObject', { virtuals: true });
+
+/* ─────────────────────────────────────────────────────────────
+ * الفهارس
+ * ───────────────────────────────────────────────────────────── */
+
 /**
  * فرض حساب بنكي نشط واحد فقط (متطلب صريح).
  */
@@ -145,6 +207,11 @@ bankAccountSchema.index(
     name: 'unique_active_bank_account',
   }
 );
+
+/**
+ * منع تكرار رقم الحساب.
+ */
+bankAccountSchema.index({ accountNumber: 1 }, { unique: true });
 
 export const BankAccount = model('BankAccount', bankAccountSchema);
 

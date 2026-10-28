@@ -1,503 +1,286 @@
 /**
  * @file customerReturnController.js
  * @description
- * واجهات التحكم لمرتجعات العملاء.
- * تدير دورة حياة المرتجع (إنشاء ← موافقة/رفض) مع التحقق من فترة السماح.
+ * مرتجعات العملاء — 7 أيام فترة سماح.
  *
- * لماذا هذا الملف؟
- * - المرتجع عملية حساسة: يُرجع بضاعة للمخزون، ويُسوّى مالياً.
- * - الموافقة (Approve) هي العملية الفعلية (تغيير المخزون + المال).
- * - نستخدم فترة سماح (grace period) افتراضية 7 أيام من إعدادات العميل.
- * - نستخدم `stockService.returnStock` لضمان إرجاع البضاعة للدفعة الصحيحة.
- * - Scope: المندوب يرى مرتجعات صيدلياته فقط، والصيدلية ترى مرتجعاتها فقط.
+ * عند approve:
+ *  - Stock يُرجع
+ *  - CashTransaction (إن refund cash) أو خصم رصيد (balance_deduction)
+ *  - AccountingEntry (SALE_RETURN)
  */
 
-import { AUDIT_ACTIONS } from '../models/AuditLog.js';
-import {
-  CustomerReturn,
-  RETURN_STATUSES,
-  SETTLEMENT_TYPES,
-} from '../models/CustomerReturn.js';
-import { Invoice } from '../models/Invoice.js';
-import { Customer } from '../models/Customer.js';
-import { CashTransaction } from '../models/CashTransaction.js';
-import { Settings } from '../models/Settings.js';
-import { AppError, asyncHandler } from '../middlewares/errorMiddleware.js';
-import { logAuditEvent } from '../middlewares/auditLogMiddleware.js';
+import CustomerReturn from '../models/CustomerReturn.js';
+import Customer from '../models/Customer.js';
+import cashService from '../services/cashService.js';
+import accountingService from '../services/accountingService.js';
 import { returnStock } from '../services/stockService.js';
-import { logger } from '../utils/logger.js';
+import { AppError } from '../middlewares/errorMiddleware.js';
+import { logAuditEvent } from '../middlewares/auditLogMiddleware.js';
+import { AUDIT_ACTIONS } from '../utils/constants.js';
+import logger from '../utils/logger.js';
 
-// ============================================================
-// Helpers
-// ============================================================
+const round2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
 
-/**
- * توليد رقم مرتجع فريد.
- * النمط: RET-YYYYMMDD-XXXX
- *
- * @async
- * @returns {Promise<string>}
- */
-async function generateReturnNumber() {
-  const settings = await Settings.getSettings();
-  const prefix = settings.sales?.prefixes?.customerReturn || 'RET';
-  const dateStr = new Date().toISOString().slice(0, 10).replace(/-/g, '');
-
-  const lastReturn = await CustomerReturn.findOne({
-    returnNumber: new RegExp(`^${prefix}-${dateStr}-`),
-  })
-    .sort({ returnNumber: -1 })
-    .select('returnNumber')
-    .lean();
-
-  let sequence = 1;
-  if (lastReturn) {
-    const parts = lastReturn.returnNumber.split('-');
-    sequence = parseInt(parts[parts.length - 1], 10) + 1;
-  }
-
-  return `${prefix}-${dateStr}-${String(sequence).padStart(4, '0')}`;
-}
-
-/**
- * توليد رقم حركة مالية.
- */
-function generateTransactionNumber(prefix) {
-  return `${prefix}-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
-}
-
-/**
- * بناء استجابة موحّدة.
- */
-const buildCustomerReturnPayload = (ret) => ({
-  id: ret._id,
-  returnNumber: ret.returnNumber,
-  originalInvoice: ret.originalInvoice,
-  pharmacy: ret.pharmacy,
-  items: ret.items,
-  total: ret.total,
-  returnDate: ret.returnDate,
-  invoiceDate: ret.invoiceDate,
-  gracePeriodDays: ret.gracePeriodDays,
-  isWithinGracePeriod: ret.isWithinGracePeriod,
-  status: ret.status,
-  settlementType: ret.settlementType,
-  settledAmount: ret.settledAmount,
-  settlementTransaction: ret.settlementTransaction,
-  approvedBy: ret.approvedBy,
-  approvedAt: ret.approvedAt,
-  rejectedBy: ret.rejectedBy,
-  rejectedAt: ret.rejectedAt,
-  rejectionReason: ret.rejectionReason,
-  notes: ret.notes,
-  createdAt: ret.createdAt,
-  updatedAt: ret.updatedAt,
-});
-
-// ============================================================
-// 1) القراءة
-// ============================================================
-
-/**
+/* ─────────────────────────────────────────────────────────────
  * GET /api/customer-returns
- */
-export const listCustomerReturns = asyncHandler(async (req, res) => {
-  const {
-    page,
-    limit,
-    search,
-    pharmacy,
-    originalInvoice,
-    status,
-    settlementType,
-    outsideGracePeriod,
-    hasDamagedItems,
-    dateFrom,
-    dateTo,
-    sortBy,
-    sortOrder,
-  } = req.validatedQuery || req.query;
-
-  const filter = {};
-
-  // Scope للمندوب
-  if (req.scope?.salesRepId) {
-    // المرتجع مرتبط بالصيدلية، والصيدلية مرتبطة بالمندوب
-    const customerIds = await Customer.find({ assignedSalesRep: req.scope.salesRepId }).select('_id').lean();
-    filter.pharmacy = { $in: customerIds.map((c) => c._id) };
-  } else if (pharmacy) {
-    filter.pharmacy = pharmacy;
-  }
-
-  // Scope للصيدلية
-  if (req.scope?.customerId) {
-    filter.pharmacy = req.scope.customerId;
-  }
-
-  if (originalInvoice) filter.originalInvoice = originalInvoice;
-  if (status) filter.status = status;
-  if (settlementType) filter.settlementType = settlementType;
-
-  if (outsideGracePeriod) filter.isWithinGracePeriod = false;
-  if (hasDamagedItems) filter['items.reason'] = 'damaged';
-
-  if (dateFrom || dateTo) {
-    filter.returnDate = {};
-    if (dateFrom) filter.returnDate.$gte = dateFrom;
-    if (dateTo) filter.returnDate.$lte = dateTo;
-  }
-
-  if (search) {
-    const rx = new RegExp(search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
-    filter.$or = [{ returnNumber: rx }];
-  }
-
-  const skip = (page - 1) * limit;
-  const sortDirection = sortOrder === 'asc' ? 1 : -1;
-
-  const [returns, total] = await Promise.all([
-    CustomerReturn.find(filter)
-      .populate('pharmacy', 'name code phone')
-      .populate('originalInvoice', 'invoiceNumber total')
-      .sort({ [sortBy]: sortDirection })
-      .skip(skip)
-      .limit(limit),
-    CustomerReturn.countDocuments(filter),
-  ]);
-
-  return res.status(200).json({
-    success: true,
-    data: {
-      items: returns.map(buildCustomerReturnPayload),
-      pagination: {
-        page,
-        limit,
-        total,
-        totalPages: Math.ceil(total / limit),
-        hasNext: skip + returns.length < total,
-        hasPrev: page > 1,
-      },
-    },
-  });
-});
-
-/**
- * GET /api/customer-returns/:id
- */
-export const getCustomerReturn = asyncHandler(async (req, res) => {
-  const ret = await CustomerReturn.findById(req.params.id)
-    .populate('pharmacy', 'name code phone')
-    .populate('originalInvoice', 'invoiceNumber total items invoiceDate')
-    .populate('approvedBy', 'name')
-    .populate('rejectedBy', 'name');
-
-  if (!ret) {
-    throw new AppError('المرتجع غير موجود.', 404, 'RETURN_NOT_FOUND');
-  }
-
-  // Scope للمندوب
-  if (req.scope?.salesRepId) {
-    const customer = await Customer.findById(ret.pharmacy._id).select('assignedSalesRep').lean();
-    if (String(customer?.assignedSalesRep) !== String(req.scope.salesRepId)) {
-      throw new AppError('لا تملك صلاحية الوصول لهذا المرتجع.', 403, 'FORBIDDEN');
-    }
-  }
-
-  // Scope للصيدلية
-  if (req.scope?.customerId && String(ret.pharmacy._id) !== String(req.scope.customerId)) {
-    throw new AppError('لا تملك صلاحية الوصول لهذا المرتجع.', 403, 'FORBIDDEN');
-  }
-
-  return res.status(200).json({
-    success: true,
-    data: buildCustomerReturnPayload(ret),
-  });
-});
-
-// ============================================================
-// 2) الإنشاء
-// ============================================================
-
-/**
- * POST /api/customer-returns
- *
- * ملاحظة: الإنشاء لا يؤثر على المخزون أو المال (الحالة pending).
- * التأثير الفعلي يحدث عند الموافقة (approve).
- */
-export const createCustomerReturn = asyncHandler(async (req, res) => {
-  const data = req.body;
-
-  // 1. التحقق من الفاتورة الأصلية
-  const invoice = await Invoice.findById(data.originalInvoice);
-  if (!invoice) {
-    throw new AppError('الفاتورة الأصلية غير موجودة.', 404, 'INVOICE_NOT_FOUND');
-  }
-
-  if (invoice.status === 'cancelled') {
-    throw new AppError('لا يمكن الإرجاع من فاتورة ملغاة.', 409, 'INVOICE_CANCELLED');
-  }
-
-  // 2. التحقق من الصيدلية ومطابقتها للفاتورة
-  const customer = await Customer.findById(data.pharmacy);
-  if (!customer) {
-    throw new AppError('الصيدلية غير موجودة.', 404, 'CUSTOMER_NOT_FOUND');
-  }
-
-  if (String(invoice.pharmacy) !== String(customer._id)) {
-    throw new AppError('الصيدلية لا تطابق الصيدلية في الفاتورة الأصلية.', 400, 'PHARMACY_MISMATCH');
-  }
-
-  // 3. حساب فترة السماح
-  const gracePeriodDays = customer.returnGracePeriod ?? 7;
-  const returnDate = data.returnDate || new Date();
-  const diffMs = returnDate.getTime() - invoice.invoiceDate.getTime();
-  const diffDays = diffMs / (1000 * 60 * 60 * 24);
-  const isWithinGracePeriod = diffDays <= gracePeriodDays;
-
-  // 4. التحقق من وجود البنود في الفاتورة الأصلية (تحقق أساسي)
-  for (const returnItem of data.items) {
-    const invoiceItem = invoice.items.find(
-      (i) => String(i.item) === String(returnItem.item) && i.batch === returnItem.batch
-    );
-    if (!invoiceItem) {
-      throw new AppError(
-        `البند ${returnItem.item} بدفعة ${returnItem.batch} غير موجود في الفاتورة الأصلية.`,
-        400,
-        'ITEM_NOT_IN_INVOICE'
-      );
-    }
-  }
-
-  // 5. إنشاء المرتجع
-  const returnNumber = await generateReturnNumber();
-
-  const customerReturn = await CustomerReturn.create({
-    returnNumber,
-    originalInvoice: data.originalInvoice,
-    pharmacy: data.pharmacy,
-    items: data.items,
-    total: data.total,
-    returnDate,
-    invoiceDate: invoice.invoiceDate,
-    gracePeriodDays,
-    isWithinGracePeriod,
-    status: RETURN_STATUSES.PENDING,
-    settlementType: data.settlementType,
-    settledAmount: 0, // يُملأ عند الموافقة
-    notes: data.notes,
-    createdBy: req.user._id,
-  });
-
-  await logAuditEvent({
-    req,
-    action: AUDIT_ACTIONS.CREATE,
-    resource: 'CustomerReturn',
-    resourceId: customerReturn._id,
-    description: `إنشاء مرتجع ${returnNumber} للفاتورة ${invoice.invoiceNumber}`,
-    success: true,
-    meta: {
-      after: { returnNumber, total: data.total, isWithinGracePeriod, status: 'pending' },
-    },
-  });
-
-  return res.status(201).json({
-    success: true,
-    data: buildCustomerReturnPayload(customerReturn),
-  });
-});
-
-// ============================================================
-// 3) الموافقة (Approve)
-// ============================================================
-
-/**
- * POST /api/customer-returns/:id/approve
- *
- * التأثير الفعلي:
- * 1. إرجاع البضاعة إلى Stock.
- * 2. تسوية مالية (نقدي أو خصم رصيد).
- * 3. تحديث حالة المرتجع.
- */
-export const approveCustomerReturn = asyncHandler(async (req, res) => {
-  const { settledAmount, cashFund, bankAccount, notes } = req.body;
-  const returnId = req.params.id;
-
-  const customerReturn = await CustomerReturn.findById(returnId);
-  if (!customerReturn) {
-    throw new AppError('المرتجع غير موجود.', 404, 'RETURN_NOT_FOUND');
-  }
-
-  if (customerReturn.status !== RETURN_STATUSES.PENDING) {
-    throw new AppError(
-      `لا يمكن الموافقة على مرتجع في حالة ${customerReturn.status}.`,
-      409,
-      'INVALID_RETURN_STATUS'
-    );
-  }
-
-  if (settledAmount > customerReturn.total + 0.01) {
-    throw new AppError('المبلغ المُسوَّى يتجاوز إجمالي المرتجع.', 400, 'SETTLED_AMOUNT_EXCEEDS_TOTAL');
-  }
-
-  // 1. إرجاع البضاعة إلى المخزون (Rollback إذا فشل)
-  // نحتاج لمعرفة المخزن — نستخدم مخزن الفاتورة أو الافتراضي
-  const invoice = await Invoice.findById(customerReturn.originalInvoice);
-  if (!invoice) {
-    throw new AppError('الفاتورة الأصلية غير موجودة.', 404, 'INVOICE_NOT_FOUND');
-  }
-
-  const warehouseId = invoice.warehouse;
-  const stockRollbackLog = [];
-
+ * ───────────────────────────────────────────────────────────── */
+export const listCustomerReturns = async (req, res, next) => {
   try {
-    for (const item of customerReturn.items) {
-      await returnStock({
-        itemId: item.item,
-        warehouseId: warehouseId,
-        batch: item.batch,
-        quantity: item.quantity,
-        meta: {
-          // نحتاج expiry و unitCost من الفاتورة الأصلية (أو من Stock)
-          // هنا نستخدم قيم افتراضية آمنة (سيتم دمجها مع الدفعة الحالية)
-          unitCost: 0,
-          unitPrice: item.unitPrice,
-          notes: `مرتجع عميل ${customerReturn.returnNumber}`,
-        },
-      });
+    const { page = 1, limit = 20, status, customerId, from, to } = req.query;
 
-      stockRollbackLog.push({
-        itemId: item.item,
-        warehouseId,
-        batch: item.batch,
-        quantity: item.quantity,
-      });
+    const filter = {};
+    if (status && status !== 'all') filter.status = status;
+    if (customerId) filter.customerId = customerId;
+    if (from || to) {
+      filter.createdAt = {};
+      if (from) filter.createdAt.$gte = new Date(from);
+      if (to) filter.createdAt.$lte = new Date(to);
     }
+    if (req.scope?.salesRepId) filter.salesRepId = req.scope.salesRepId;
+    if (req.scope?.customerId) filter.customerId = req.scope.customerId;
+
+    const skip = (Number(page) - 1) * Number(limit);
+    const [returns, total] = await Promise.all([
+      CustomerReturn.find(filter)
+        .populate('customerId', 'name phone code')
+        .populate('invoiceId', 'invoiceNumber')
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(Number(limit))
+        .lean(),
+      CustomerReturn.countDocuments(filter),
+    ]);
+
+    res.status(200).json({
+      success: true,
+      data: returns,
+      pagination: {
+        page: Number(page),
+        limit: Number(limit),
+        total,
+        totalPages: Math.ceil(total / Number(limit)),
+      },
+    });
   } catch (error) {
-    logger.error(`فشل إرجاع المخزون في الموافقة: ${error.message}. جارٍ Rollback...`);
-    // (Rollback للمرتجع يعني خصم البضاعة مجدداً، لكن نتركها للـ Admin يدوياً)
-    throw new AppError('فشل إرجاع البضاعة للمخزون. يرجى مراجعة الإدارة.', 500, 'STOCK_RETURN_FAILED');
+    next(error);
   }
+};
 
-  // 2. التسوية المالية
-  let settlementTransactionId = null;
+/* ─────────────────────────────────────────────────────────────
+ * GET /api/customer-returns/:id
+ * ───────────────────────────────────────────────────────────── */
+export const getCustomerReturn = async (req, res, next) => {
+  try {
+    const returnDoc = await CustomerReturn.findById(req.params.id)
+      .populate('customerId', 'name phone code')
+      .populate('invoiceId', 'invoiceNumber total')
+      .populate('items.itemId', 'name code units')
+      .populate('approvedBy', 'fullName');
 
-  if (customerReturn.settlementType === SETTLEMENT_TYPES.CASH_REFUND) {
-    // استرداد نقدي — نتحقق من وجود cashFund أو bankAccount
-    if (!cashFund && !bankAccount) {
-      throw new AppError('يجب تحديد صندوق أو حساب بنكي للاسترداد النقدي.', 400, 'NO_CASH_ACCOUNT');
+    if (!returnDoc) {
+      throw new AppError('المرتجع غير موجود', 404, 'RETURN_NOT_FOUND');
     }
 
-    const cashTx = await CashTransaction.create({
-      transactionNumber: generateTransactionNumber('CT'),
-      accountType: bankAccount ? 'bank' : 'cash',
-      cashFund: cashFund || null,
-      bankAccount: bankAccount || null,
-      direction: 'out',
-      category: 'return_refund',
-      amount: settledAmount,
-      description: `استرداد نقدي لمرتجع ${customerReturn.returnNumber}`,
-      referenceType: 'CustomerReturn',
-      referenceId: customerReturn._id,
-      party: customerReturn.pharmacy,
-      partyType: 'Customer',
+    res.status(200).json({ success: true, data: returnDoc });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/* ─────────────────────────────────────────────────────────────
+ * POST /api/customer-returns
+ * ───────────────────────────────────────────────────────────── */
+export const createCustomerReturn = async (req, res, next) => {
+  try {
+    const { customerId, invoiceId, items, reason, settlementType, notes } = req.body;
+
+    if (!customerId) throw new AppError('العميل مطلوب', 400, 'MISSING_CUSTOMER');
+    if (!Array.isArray(items) || items.length === 0) {
+      throw new AppError('المرتجع يحتاج بنداً واحداً على الأقل', 400, 'EMPTY_ITEMS');
+    }
+    if (!['cash_refund', 'balance_deduction'].includes(settlementType)) {
+      throw new AppError('طريقة التسوية غير صحيحة', 400, 'INVALID_SETTLEMENT');
+    }
+
+    const customer = await Customer.findById(customerId);
+    if (!customer) throw new AppError('العميل غير موجود', 404, 'CUSTOMER_NOT_FOUND');
+
+    const total = round2(
+      items.reduce((sum, it) => sum + Number(it.unitPrice) * Number(it.quantity), 0)
+    );
+
+    const returnDoc = await CustomerReturn.create({
+      customerId,
+      invoiceId: invoiceId || null,
+      items,
+      total,
+      reason,
+      settlementType,
+      notes,
+      status: 'pending',
       createdBy: req.user._id,
     });
 
-    settlementTransactionId = cashTx._id;
-  } else if (customerReturn.settlementType === SETTLEMENT_TYPES.BALANCE_DEDUCTION) {
-    // خصم من رصيد الصيدلية
-    await Customer.updateOne(
-      { _id: customerReturn.pharmacy },
-      { $inc: { currentBalance: -settledAmount } }
-    );
+    await logAuditEvent({
+      req,
+      action: AUDIT_ACTIONS.CREATE,
+      resource: 'CustomerReturn',
+      resourceId: returnDoc._id,
+      description: `مرتجع عميل جديد — ${total} SDG`,
+      success: true,
+    });
+
+    res.status(201).json({
+      success: true,
+      message: 'تم إنشاء المرتجع (بانتظار الموافقة)',
+      data: returnDoc,
+    });
+  } catch (error) {
+    next(error);
   }
+};
 
-  // 3. تحديث المرتجع
-  customerReturn.status = RETURN_STATUSES.CONFIRMED;
-  customerReturn.settledAmount = settledAmount;
-  customerReturn.settlementTransaction = settlementTransactionId;
-  customerReturn.approvedBy = req.user._id;
-  customerReturn.approvedAt = new Date();
-  if (notes) customerReturn.notes = notes;
+/* ─────────────────────────────────────────────────────────────
+ * POST /api/customer-returns/:id/approve
+ * اعتماد مرتجع — Phase 3 integration
+ * ───────────────────────────────────────────────────────────── */
+export const approveCustomerReturn = async (req, res, next) => {
+  try {
+    const { settledAmount, cashFundId } = req.body;
 
-  await customerReturn.save();
+    const returnDoc = await CustomerReturn.findById(req.params.id);
+    if (!returnDoc) throw new AppError('المرتجع غير موجود', 404, 'RETURN_NOT_FOUND');
+    if (returnDoc.status !== 'pending') {
+      throw new AppError('المرتجع ليس في حالة pending', 409, 'INVALID_STATUS');
+    }
 
-  // 4. تدقيق
-  await logAuditEvent({
-    req,
-    action: AUDIT_ACTIONS.UPDATE,
-    resource: 'CustomerReturn',
-    resourceId: customerReturn._id,
-    description: `الموافقة على مرتجع ${customerReturn.returnNumber} بمبلغ ${settledAmount}`,
-    success: true,
-    meta: {
-      after: { status: 'confirmed', settledAmount, settlementType: customerReturn.settlementType },
-    },
-  });
+    const amount = round2(settledAmount ?? returnDoc.total);
 
-  return res.status(200).json({
-    success: true,
-    data: buildCustomerReturnPayload(customerReturn),
-    message: 'تمت الموافقة على المرتجع وتسويته بنجاح.',
-  });
-});
+    // ─── 1) إرجاع Stock ───
+    try {
+      await returnStock({
+        issuedLots: returnDoc.items.map((it) => ({
+          itemId: it.itemId,
+          warehouseId: returnDoc.warehouse || it.warehouse,
+          batch: it.batch,
+          quantity: it.quantity,
+          unitCost: it.unitCost || 0,
+        })),
+        user: req.user,
+      });
+    } catch (err) {
+      logger.warn(`[customerReturn] فشل إرجاع Stock: ${err.message}`);
+      throw new AppError('فشل إرجاع المخزون', 500, 'STOCK_RETURN_FAILED');
+    }
 
-// ============================================================
-// 4) الرفض (Reject)
-// ============================================================
+    // ─── 2) التسوية المالية ───
+    if (returnDoc.settlementType === 'cash_refund') {
+      // CashTransaction (خروج)
+      await cashService.createCashTransaction({
+        direction: 'out',
+        amount,
+        method: 'cash',
+        cashFundId: cashFundId || null,
+        transactionDate: new Date(),
+        description: `رد نقدي مرتجع — ${returnDoc._id}`,
+        referenceType: 'customer_return',
+        referenceId: returnDoc._id,
+        user: req.user,
+        skipEntry: true,
+      });
 
-/**
+      await accountingService.createSaleReturnEntry({
+        amount,
+        refundType: 'cash',
+        date: new Date(),
+        sourceType: 'CustomerReturn',
+        sourceId: returnDoc._id,
+        cashFundId: cashFundId || null,
+        user: req.user,
+        description: `مرتجع بيع نقدي`,
+      });
+    } else if (returnDoc.settlementType === 'balance_deduction') {
+      // خصم من رصيد العميل
+      await Customer.updateOne(
+        { _id: returnDoc.customerId },
+        { $inc: { currentBalance: -amount } }
+      );
+
+      await accountingService.createSaleReturnEntry({
+        amount,
+        refundType: 'balance',
+        date: new Date(),
+        sourceType: 'CustomerReturn',
+        sourceId: returnDoc._id,
+        user: req.user,
+        description: `مرتجع بيع (خصم رصيد)`,
+      });
+    }
+
+    // ─── 3) تحديث الحالة ───
+    returnDoc.status = 'approved';
+    returnDoc.settledAmount = amount;
+    returnDoc.approvedBy = req.user._id;
+    returnDoc.approvedAt = new Date();
+    await returnDoc.save();
+
+    // ─── 4) Audit ───
+    await logAuditEvent({
+      req,
+      action: AUDIT_ACTIONS.UPDATE,
+      resource: 'CustomerReturn',
+      resourceId: returnDoc._id,
+      description: `اعتماد مرتجع — ${amount} SDG`,
+      success: true,
+    });
+
+    res.status(200).json({
+      success: true,
+      message: 'تم اعتماد المرتجع',
+      data: returnDoc,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/* ─────────────────────────────────────────────────────────────
  * POST /api/customer-returns/:id/reject
- */
-export const rejectCustomerReturn = asyncHandler(async (req, res) => {
-  const { rejectionReason } = req.body;
-  const returnId = req.params.id;
+ * ───────────────────────────────────────────────────────────── */
+export const rejectCustomerReturn = async (req, res, next) => {
+  try {
+    const { rejectionReason } = req.body;
+    if (!rejectionReason) {
+      throw new AppError('سبب الرفض مطلوب', 400, 'MISSING_REASON');
+    }
 
-  const customerReturn = await CustomerReturn.findById(returnId);
-  if (!customerReturn) {
-    throw new AppError('المرتجع غير موجود.', 404, 'RETURN_NOT_FOUND');
+    const returnDoc = await CustomerReturn.findById(req.params.id);
+    if (!returnDoc) throw new AppError('المرتجع غير موجود', 404, 'RETURN_NOT_FOUND');
+    if (returnDoc.status !== 'pending') {
+      throw new AppError('المرتجع ليس في حالة pending', 409, 'INVALID_STATUS');
+    }
+
+    returnDoc.status = 'rejected';
+    returnDoc.rejectionReason = rejectionReason;
+    returnDoc.rejectedBy = req.user._id;
+    returnDoc.rejectedAt = new Date();
+    await returnDoc.save();
+
+    await logAuditEvent({
+      req,
+      action: AUDIT_ACTIONS.UPDATE,
+      resource: 'CustomerReturn',
+      resourceId: returnDoc._id,
+      description: `رفض مرتجع — ${rejectionReason}`,
+      success: true,
+    });
+
+    res.status(200).json({
+      success: true,
+      message: 'تم رفض المرتجع',
+      data: returnDoc,
+    });
+  } catch (error) {
+    next(error);
   }
-
-  if (customerReturn.status !== RETURN_STATUSES.PENDING) {
-    throw new AppError(
-      `لا يمكن رفض مرتجع في حالة ${customerReturn.status}.`,
-      409,
-      'INVALID_RETURN_STATUS'
-    );
-  }
-
-  customerReturn.status = RETURN_STATUSES.REJECTED;
-  customerReturn.rejectedBy = req.user._id;
-  customerReturn.rejectedAt = new Date();
-  customerReturn.rejectionReason = rejectionReason;
-
-  await customerReturn.save();
-
-  await logAuditEvent({
-    req,
-    action: AUDIT_ACTIONS.UPDATE,
-    resource: 'CustomerReturn',
-    resourceId: customerReturn._id,
-    description: `رفض مرتجع ${customerReturn.returnNumber}: ${rejectionReason}`,
-    success: true,
-    meta: { after: { status: 'rejected', rejectionReason } },
-  });
-
-  return res.status(200).json({
-    success: true,
-    data: buildCustomerReturnPayload(customerReturn),
-    message: 'تم رفض المرتجع.',
-  });
-});
-
-// ============================================================
-// تصدير موحّد
-// ============================================================
-
-export default {
-  listCustomerReturns,
-  getCustomerReturn,
-  createCustomerReturn,
-  approveCustomerReturn,
-  rejectCustomerReturn,
 };

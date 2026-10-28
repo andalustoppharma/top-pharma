@@ -1,32 +1,33 @@
 /**
  * @file server.js
  * @description
- * نقطة الدخول الرئيسية للـ Backend — Phase 2.5 (كل المسارات).
- *
- * ⚠️ يشمل:
- * - Phase 0: Auth + Users
- * - Phase 1: Categories, Warehouses, Items, Suppliers, Customers, Stocks
- * - Phase 2: Invoices, DeliveryNotes, CustomerReturns, SupplierReturns, PurchaseReceipts
- * - Phase 2.5: Draft (مدمج في Invoice)
+ * نقطة دخول التطبيق (Backend) — Phase 4 (Reports).
  */
 
-import compression from 'compression';
-import cookieParser from 'cookie-parser';
-import cors from 'cors';
 import express from 'express';
+import cors from 'cors';
 import helmet from 'helmet';
 import morgan from 'morgan';
+import compression from 'compression';
+import cookieParser from 'cookie-parser';
 
-import { connectDatabase, disconnectDatabase, isDatabaseReady } from './config/database.js';
-import { env, isProduction } from './config/env.js';
+// ─── Config ───
+import { connectDatabase } from './config/database.js';
+import env from './config/env.js';
+import logger from './utils/logger.js';
+
+// ─── Middlewares ───
 import { errorHandler, notFoundHandler } from './middlewares/errorMiddleware.js';
-import { globalLimiter, readLimiter } from './middlewares/rateLimitMiddleware.js';
+import { globalLimiter } from './middlewares/rateLimitMiddleware.js';
 
-// ── Phase 0 Routes ──
+// ─── Jobs ───
+import { startJobs } from './jobs/index.js';
+
+// ─── Routes — Phase 0 ───
 import authRoutes from './routes/authRoutes.js';
 import userRoutes from './routes/userRoutes.js';
 
-// ── Phase 1 Routes ──
+// ─── Routes — Phase 1 ───
 import categoryRoutes from './routes/categoryRoutes.js';
 import warehouseRoutes from './routes/warehouseRoutes.js';
 import itemRoutes from './routes/itemRoutes.js';
@@ -34,203 +35,153 @@ import supplierRoutes from './routes/supplierRoutes.js';
 import customerRoutes from './routes/customerRoutes.js';
 import stockRoutes from './routes/stockRoutes.js';
 
-// ── Phase 2 Routes ──
+// ─── Routes — Phase 2 ───
 import invoiceRoutes from './routes/invoiceRoutes.js';
 import deliveryNoteRoutes from './routes/deliveryNoteRoutes.js';
 import customerReturnRoutes from './routes/customerReturnRoutes.js';
 import supplierReturnRoutes from './routes/supplierReturnRoutes.js';
 import purchaseReceiptRoutes from './routes/purchaseReceiptRoutes.js';
-import dashboardRoutes from './routes/dashboardRoutes.js';
 
-import { startAllJobs, stopAllJobs } from './jobs/index.js';
-import { verifyEmailConnection } from './utils/email.js';
-import { logger } from './utils/logger.js';
+// ─── Routes — Phase 3 ───
+import cashFundRoutes from './routes/cashFundRoutes.js';
+import bankAccountRoutes from './routes/bankAccountRoutes.js';
+import cashTransactionRoutes from './routes/cashTransactionRoutes.js';
+import accountingEntryRoutes from './routes/accountingEntryRoutes.js';
+import checkRoutes from './routes/checkRoutes.js';
 
-/**
- * إنشاء تطبيق Express.
- * @returns {import('express').Express}
- */
-const createApp = () => {
-  const app = express();
+// ─── Routes — Phase 4 (Reports) ───
+import financeReportRoutes from './routes/financeReportRoutes.js';
+import salesReportRoutes from './routes/salesReportRoutes.js';
+import customerReportRoutes from './routes/customerReportRoutes.js';
+import supplierReportRoutes from './routes/supplierReportRoutes.js';
+import inventoryReportRoutes from './routes/inventoryReportRoutes.js';
 
-  app.set('trust proxy', 1);
+const app = express();
 
-  app.use(
-    helmet({
-      contentSecurityPolicy: false,
-      crossOriginResourcePolicy: { policy: 'same-site' },
-    })
-  );
+/* ═════════════════════════════════════════════════════════════
+ * 1) Middlewares
+ * ═════════════════════════════════════════════════════════════ */
+app.use(helmet());
 
-  app.use(
-    cors({
-      origin: (origin, callback) => {
-        if (!origin) return callback(null, true);
-        if (env.CORS_ORIGIN.includes(origin)) return callback(null, true);
-        logger.warn(`CORS blocked: ${origin}`);
-        return callback(new Error('CORS غير مسموح.'), false);
-      },
-      credentials: true,
-      methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'OPTIONS'],
-      allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
-      exposedHeaders: ['X-Total-Count'],
-      maxAge: 600,
-    })
-  );
+app.use(
+  cors({
+    origin: env.FRONTEND_URL || 'http://localhost:5173',
+    credentials: true,
+  })
+);
 
-  app.use(compression());
-  app.use(express.json({ limit: '1mb' }));
-  app.use(express.urlencoded({ extended: true, limit: '1mb' }));
-  app.use(cookieParser());
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+app.use(cookieParser());
+app.use(compression());
 
-  if (!isProduction()) {
-    app.use(
-      morgan('dev', {
-        stream: { write: (message) => logger.info(message.trim()) },
-      })
-    );
-  }
+if (env.NODE_ENV === 'development') {
+  app.use(morgan('dev'));
+}
 
-app.use(env.API_PREFIX, (req, res, next) => {
-  if (req.method === 'GET') {
-    return readLimiter(req, res, next);
-  }
-  return globalLimiter(req, res, next);
+app.use('/api', globalLimiter);
+
+/* ═════════════════════════════════════════════════════════════
+ * 2) Health check
+ * ═════════════════════════════════════════════════════════════ */
+app.get('/api/health', (req, res) => {
+  res.status(200).json({
+    success: true,
+    message: 'Pharma System API is running',
+    timestamp: new Date().toISOString(),
+    environment: env.NODE_ENV,
+    version: '4.0.0',
+    phase: 'Phase 4 — Reports (18 reports)',
+  });
 });
-  // ── نقطة الفحص الصحي ──
-  app.get(`${env.API_PREFIX}/health`, (_req, res) => {
-    res.status(200).json({
-      success: true,
-      data: {
-        status: 'ok',
-        env: env.NODE_ENV,
-        database: isDatabaseReady() ? 'connected' : 'disconnected',
-        uptime: Math.round(process.uptime()),
-        timestamp: new Date().toISOString(),
-      },
-    });
-  });
 
-  // ── Phase 0 ──
-  app.use(`${env.API_PREFIX}/auth`, authRoutes);
-  app.use(`${env.API_PREFIX}/users`, userRoutes);
+/* ═════════════════════════════════════════════════════════════
+ * 3) Routes — Phase 0
+ * ═════════════════════════════════════════════════════════════ */
+app.use('/api/auth', authRoutes);
+app.use('/api/users', userRoutes);
 
-  // ── Phase 1 ──
-  app.use(`${env.API_PREFIX}/categories`, categoryRoutes);
-  app.use(`${env.API_PREFIX}/warehouses`, warehouseRoutes);
-  app.use(`${env.API_PREFIX}/items`, itemRoutes);
-  app.use(`${env.API_PREFIX}/suppliers`, supplierRoutes);
-  app.use(`${env.API_PREFIX}/customers`, customerRoutes);
-  app.use(`${env.API_PREFIX}/stocks`, stockRoutes);
+/* ═════════════════════════════════════════════════════════════
+ * 4) Routes — Phase 1
+ * ═════════════════════════════════════════════════════════════ */
+app.use('/api/categories', categoryRoutes);
+app.use('/api/warehouses', warehouseRoutes);
+app.use('/api/items', itemRoutes);
+app.use('/api/suppliers', supplierRoutes);
+app.use('/api/customers', customerRoutes);
+app.use('/api/stocks', stockRoutes);
 
-  // ── Phase 2 ──
-  app.use(`${env.API_PREFIX}/invoices`, invoiceRoutes);
-  app.use(`${env.API_PREFIX}/delivery-notes`, deliveryNoteRoutes);
-  app.use(`${env.API_PREFIX}/customer-returns`, customerReturnRoutes);
-  app.use(`${env.API_PREFIX}/supplier-returns`, supplierReturnRoutes);
-  app.use(`${env.API_PREFIX}/purchase-receipts`, purchaseReceiptRoutes);
+/* ═════════════════════════════════════════════════════════════
+ * 5) Routes — Phase 2
+ * ═════════════════════════════════════════════════════════════ */
+app.use('/api/invoices', invoiceRoutes);
+app.use('/api/delivery-notes', deliveryNoteRoutes);
+app.use('/api/customer-returns', customerReturnRoutes);
+app.use('/api/supplier-returns', supplierReturnRoutes);
+app.use('/api/purchase-receipts', purchaseReceiptRoutes);
 
-  // ── Phase 4: Dashboard & Reports ──
-  app.use(`${env.API_PREFIX}/dashboard`, dashboardRoutes);
-  // ── صفحة الجذر ──
-  app.get('/', (_req, res) => {
-    res.status(200).json({
-      success: true,
-      data: {
-        name: 'Pharma System API',
-        version: '2.5.0',
-        docs: `${env.API_PREFIX}/health`,
-        time: new Date().toISOString(),
-      },
-    });
-  });
+/* ═════════════════════════════════════════════════════════════
+ * 6) Routes — Phase 3
+ * ═════════════════════════════════════════════════════════════ */
+app.use('/api/cash-funds', cashFundRoutes);
+app.use('/api/bank-accounts', bankAccountRoutes);
+app.use('/api/cash-transactions', cashTransactionRoutes);
+app.use('/api/accounting-entries', accountingEntryRoutes);
+app.use('/api/checks', checkRoutes);
 
-  app.use(notFoundHandler);
-  app.use(errorHandler);
+/* ═════════════════════════════════════════════════════════════
+ * 7) Routes — Phase 4 (Reports) — 5 مجموعات
+ * ═════════════════════════════════════════════════════════════ */
+app.use('/api/reports/finance', financeReportRoutes);
+app.use('/api/reports/sales', salesReportRoutes);
+app.use('/api/reports/customers', customerReportRoutes);
+app.use('/api/reports/suppliers', supplierReportRoutes);
+app.use('/api/reports/inventory', inventoryReportRoutes);
 
-  return app;
-};
+/* ═════════════════════════════════════════════════════════════
+ * 8) 404 + Error handlers
+ * ═════════════════════════════════════════════════════════════ */
+app.use(notFoundHandler);
+app.use(errorHandler);
 
-/**
- * الإغلاق الآمن.
- * @param {import('http').Server} server
- */
-const setupGracefulShutdown = (server) => {
-  let shuttingDown = false;
+/* ═════════════════════════════════════════════════════════════
+ * 9) Start server
+ * ═════════════════════════════════════════════════════════════ */
+const PORT = env.PORT || 5000;
 
-  const shutdown = async (signal) => {
-    if (shuttingDown) return;
-    shuttingDown = true;
-
-    logger.warn(`📴 استُقبلت الإشارة ${signal}. جارٍ الإغلاق الآمن...`);
-
-    stopAllJobs();
-
-    server.close(async () => {
-      logger.info('🛑 تم إغلاق سيرفر HTTP.');
-      try {
-        await disconnectDatabase();
-      } catch (error) {
-        logger.error(`خطأ أثناء إغلاق قاعدة البيانات: ${error.message}`);
-      }
-      process.exit(0);
-    });
-
-    setTimeout(() => {
-      logger.error('⏱️ انتهت مهلة الإغلاق. إنهاء قسري.');
-      process.exit(1);
-    }, 10_000).unref();
-  };
-
-  process.on('SIGINT', () => shutdown('SIGINT'));
-  process.on('SIGTERM', () => shutdown('SIGTERM'));
-  process.on('unhandledRejection', (reason) => {
-    logger.error(`Unhandled Rejection: ${reason}`);
-  });
-  process.on('uncaughtException', (error) => {
-    logger.error(`Uncaught Exception: ${error.message}`);
-    logger.error(error.stack || '');
-    process.exit(1);
-  });
-};
-
-/**
- * تشغيل السيرفر.
- * @async
- * @returns {Promise<void>}
- */
 const startServer = async () => {
-  logger.info('🚀 بدء تشغيل Pharma System Backend (Phase 2.5)...');
-  logger.info(`📦 البيئة: ${env.NODE_ENV}`);
-
   try {
     await connectDatabase();
+    logger.info('✅ Database connected');
+
+    app.listen(PORT, () => {
+      logger.info(`🚀 Server running on http://localhost:${PORT}`);
+      logger.info(`   Environment: ${env.NODE_ENV}`);
+      logger.info(`   Frontend URL: ${env.FRONTEND_URL}`);
+      logger.info(`   Phase: 4 (Reports) — 18 reports available`);
+    });
+
+    if (env.NODE_ENV !== 'test') {
+      startJobs();
+      logger.info('⏰ Jobs started (expiry + reorder + invoiceDue + checkDue)');
+    }
   } catch (error) {
-    logger.error('❌ فشل الاتصال بقاعدة البيانات. إيقاف التشغيل.');
+    logger.error(`❌ Failed to start server: ${error.message}`);
+    logger.error(error.stack);
     process.exit(1);
   }
-
-  await verifyEmailConnection();
-
-  const app = createApp();
-
-  const server = app.listen(env.PORT, () => {
-    logger.info(`✅ السيرفر يعمل على http://localhost:${env.PORT}`);
-    logger.info(`🔗 نقطة الفحص: http://localhost:${env.PORT}${env.API_PREFIX}/health`);
-    logger.info(`🌐 CORS مسموح من: ${env.CORS_ORIGIN.join(', ')}`);
-
-    startAllJobs();
-  });
-
-  setupGracefulShutdown(server);
-  return server;
 };
 
-startServer().catch((error) => {
-  logger.error(`❌ فشل تشغيل السيرفر: ${error.message}`);
-  logger.error(error.stack || '');
+process.on('unhandledRejection', (reason) => {
+  logger.error(`❌ Unhandled Rejection: ${reason}`);
+});
+
+process.on('uncaughtException', (error) => {
+  logger.error(`❌ Uncaught Exception: ${error.message}`);
+  logger.error(error.stack);
   process.exit(1);
 });
 
-export { createApp, startServer };
-export default startServer;
+startServer();
+
+export default app;
