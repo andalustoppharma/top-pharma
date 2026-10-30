@@ -1,25 +1,11 @@
 /**
  * @file seed-test-invoices.js
- * @description
- * سكربت بيانات تجريبية لاختبار Phase 2 (فواتير + مسودات + مرتجعات).
+ * @description بيانات تجريبية للفواتير والمرتجعات — Phase 5.5 (نهائي).
  *
- * لماذا هذا الملف؟
- * - يمنح المطور بيئة اختبار جاهزة خلال ثوانٍ.
- * - يغطي: فاتورة نقدية، فاتورة آجلة، فاتورة أقساط، مسودة، اعتماد مسودة، مرتجع.
- * - Idempotent: يمسح كل بياناته القديمة (TEST-* prefix) ثم يُعيد إنشاءها.
- * - لا يمس البيانات الحقيقية (البيانات التي لا تحمل TEST- في invoiceNumber).
- *
- * ⚠️ متطلبات سابقة:
- *   1. npm run seed           (admin + 5 categories + warehouse)
- *   2. npm run seed:test      (rep/account/pharmacy + store)
- *   3. وجود أصناف (على الأقل 3)
- *   4. وجود دفعات Stock (BATCH-2026-12, BATCH-2027-03, ...)
- *
- * التشغيل:
- *   cd backend && npm run seed:invoices
+ * ✅ يستخدم cashService.createCashTransaction (الخدمة الفعلية)
+ * ✅ يُسقط فهرس transactionNumber_1 القديم (بقايا نسخة قديمة)
+ * ✅ الحقول مطابقة 100% للموديلات الفعلية
  */
-
-import mongoose from 'mongoose';
 
 import { connectDatabase, disconnectDatabase } from '../config/database.js';
 import { logger } from '../utils/logger.js';
@@ -27,29 +13,40 @@ import { logger } from '../utils/logger.js';
 import { User, USER_ROLES } from '../models/User.js';
 import { Customer } from '../models/Customer.js';
 import { Warehouse } from '../models/Warehouse.js';
-import { Item } from '../models/Item.js';
+import { CashFund } from '../models/CashFund.js';
 import { Stock } from '../models/Stock.js';
+import { Item } from '../models/Item.js';
 import { Invoice, INVOICE_STATUSES } from '../models/Invoice.js';
-import { SalesRepTransaction } from '../models/SalesRepTransaction.js';
-import { CashTransaction } from '../models/CashTransaction.js';
-import { CustomerReturn, RETURN_STATUSES, SETTLEMENT_TYPES } from '../models/CustomerReturn.js';
+import {
+  CustomerReturn,
+  RETURN_STATUSES,
+  SETTLEMENT_TYPES,
+  RETURN_REASONS,
+} from '../models/CustomerReturn.js';
 import { AuditLog } from '../models/AuditLog.js';
+import CashTransaction from '../models/CashTransaction.js';
+import cashService from '../services/cashService.js';
 
 // ============================================================
 // Helpers
 // ============================================================
 
-/**
- * مسح كل البيانات التجريبية السابقة.
- * يعتمد على Invoice.invoiceNumber يبدأ بـ "TEST-".
- */
 async function cleanupPreviousData() {
   logger.info('🧹 جاري مسح البيانات التجريبية السابقة...');
 
-  // 1. جلب كل الفواتير التجريبية
-  const testInvoices = await Invoice.find({
-    invoiceNumber: /^TEST-/,
-  }).select('_id pharmacy total').lean();
+  // ✅ إسقاط فهرس transactionNumber_1 القديم (بقايا نسخة قديمة من الموديل)
+  try {
+    await CashTransaction.collection.dropIndex('transactionNumber_1');
+    logger.info('   🗑️ حذف فهرس transactionNumber_1 القديم');
+  } catch (err) {
+    if (err.code !== 27 && err.codeName !== 'IndexNotFound') {
+      logger.warn(`   ⚠️ فشل إسقاط فهرس قديم: ${err.message}`);
+    }
+  }
+
+  const testInvoices = await Invoice.find({ invoiceNumber: /^TEST-/ })
+    .select('_id pharmacy status paymentType remainingAmount')
+    .lean();
 
   const testInvoiceIds = testInvoices.map((i) => i._id);
 
@@ -58,81 +55,90 @@ async function cleanupPreviousData() {
     return 0;
   }
 
-  // 2. حذف المرتجعات المرتبطة
   const deletedReturns = await CustomerReturn.deleteMany({
     originalInvoice: { $in: testInvoiceIds },
   });
 
-  // 3. حذف الحركات المالية
   const deletedCash = await CashTransaction.deleteMany({
-    referenceType: 'Invoice',
+    referenceType: 'invoice',
     referenceId: { $in: testInvoiceIds },
   });
 
-  // 4. حذف حركات العمولة
-  const deletedSalesRepTx = await SalesRepTransaction.deleteMany({
-    referenceType: 'Invoice',
-    referenceId: { $in: testInvoiceIds },
-  });
-
-  // 5. عكس رصيد الصيدليات (نستخدم $inc بالسالب لكل فاتورة)
+  // عكس رصيد العملاء للفواتير الآجلة/الأقساط (وليس النقدية)
   for (const inv of testInvoices) {
-    if (inv.pharmacy && inv.total > 0) {
-      // نستخدم -total لأن كل فاتورة زادت الرصيد بـ total
-      // (هذا تقريبي — يكفي للاختبار؛ يمكن حسابه بدقة من paidAmount)
-      await Customer.updateOne(
-        { _id: inv.pharmacy },
-        { $inc: { currentBalance: -inv.total } }
-      );
-    }
+    if (!inv.pharmacy) continue;
+    if (inv.status === 'draft' || inv.status === 'cancelled') continue;
+    if (inv.paymentType === 'cash') continue;
+    const remaining = inv.remainingAmount || 0;
+    if (remaining <= 0) continue;
+    await Customer.updateOne(
+      { _id: inv.pharmacy },
+      { $inc: { currentBalance: -remaining } }
+    );
   }
 
-  // 6. حذف الفواتير نفسها
   const deletedInvoices = await Invoice.deleteMany({
     _id: { $in: testInvoiceIds },
   });
 
-  // 7. حذف سجلات التدقيق
   const deletedAudit = await AuditLog.deleteMany({
     resource: 'Invoice',
     resourceId: { $in: testInvoiceIds },
   });
 
   logger.info(
-    `✅ تم مسح: ${deletedInvoices.deletedCount} فاتورة، ${deletedReturns.deletedCount} مرتجع، ${deletedCash.deletedCount} حركة نقدية، ${deletedSalesRepTx.deletedCount} عمولة، ${deletedAudit.deletedCount} تدقيق.`
+    `✅ تم مسح: ${deletedInvoices.deletedCount} فاتورة، ${deletedReturns.deletedCount} مرتجع، ${deletedCash.deletedCount} حركة نقدية، ${deletedAudit.deletedCount} تدقيق.`
   );
 
   return deletedInvoices.deletedCount;
 }
 
-/**
- * توليد رقم فاتورة اختباري.
- */
 function generateTestInvoiceNumber(seq) {
   return `TEST-INV-${String(seq).padStart(4, '0')}`;
 }
 
-/**
- * توليد رقم مرتجع اختباري.
- */
 function generateTestReturnNumber(seq) {
   return `TEST-RET-${String(seq).padStart(4, '0')}`;
 }
 
 /**
- * بناء بند فاتورة من Stock.
+ * بناء بند فاتورة متوافق مع invoiceItemSchema.
  */
 function buildInvoiceItem(stock, quantity, unitPrice) {
   return {
-    item: stock.item,
+    item: stock.item._id || stock.item,
     batch: stock.batch,
     expiry: stock.expiry,
     quantity,
-    unit: '',
+    unit: 'وحدة',
     unitPrice,
     total: Math.round(quantity * unitPrice * 100) / 100,
     unitCost: stock.unitCost || 0,
   };
+}
+
+/**
+ * إنشاء حركة نقدية عبر cashService (الخدمة الفعلية).
+ */
+async function createTestCashTransaction({
+  amount,
+  description,
+  invoiceId,
+  cashFund,
+  admin,
+}) {
+  return cashService.createCashTransaction({
+    direction: 'in',
+    amount,
+    method: 'cash',
+    cashFundId: cashFund._id,
+    transactionDate: new Date(),
+    description,
+    referenceType: 'invoice',
+    referenceId: invoiceId,
+    user: admin,
+    skipEntry: true,
+  });
 }
 
 // ============================================================
@@ -145,32 +151,51 @@ async function main() {
   await connectDatabase();
 
   try {
-    // ═══════════════════════════════════════════
-    // 1. المسح
-    // ═══════════════════════════════════════════
     await cleanupPreviousData();
 
-    // ═══════════════════════════════════════════
-    // 2. التحقق من المتطلبات
-    // ═══════════════════════════════════════════
     logger.info('🔍 التحقق من المتطلبات...');
 
     const admin = await User.findOne({ role: USER_ROLES.ADMIN, isActive: true });
-    const salesRep = await User.findOne({ role: USER_ROLES.SALES_REP, isActive: true });
-    const pharmacyUser = await User.findOne({ role: USER_ROLES.PHARMACY, isActive: true });
+    const salesRep = await User.findOne({
+      role: USER_ROLES.SALES_REP,
+      isActive: true,
+    });
+    const pharmacyUser = await User.findOne({
+      role: USER_ROLES.PHARMACY,
+      isActive: true,
+    });
 
-    if (!admin) throw new Error('❌ لم يُعثر على admin. شغّل npm run seed أولاً.');
-    if (!salesRep) throw new Error('❌ لم يُعثر على sales_rep. شغّل npm run seed:test أولاً.');
-    if (!pharmacyUser) throw new Error('❌ لم يُعثر على pharmacy. شغّل npm run seed:test أولاً.');
+    if (!admin) throw new Error('❌ لا يوجد admin. شغّل npm run seed');
+    if (!salesRep)
+      throw new Error('❌ لا يوجد sales_rep. شغّل npm run seed:test');
+    if (!pharmacyUser)
+      throw new Error('❌ لا يوجد pharmacy. شغّل npm run seed:test');
 
-    const warehouse = await Warehouse.findOne({ isDefault: true, isActive: true });
-    if (!warehouse) throw new Error('❌ لا يوجد مخزن افتراضي. شغّل npm run seed.');
+    const warehouse = await Warehouse.findOne({
+      isDefault: true,
+      isActive: true,
+    });
+    if (!warehouse)
+      throw new Error('❌ لا يوجد مخزن افتراضي. شغّل npm run seed');
 
-    // الصيدلية مرتبطة بـ pharmacyUser
-    const customer = await Customer.findOne({ isActive: true }).populate('assignedSalesRep', 'name');
-    if (!customer) throw new Error('❌ لا يوجد عملاء. أنشئ صيدلية عبر الواجهة أولاً.');
+    const cashFund = await CashFund.findOne({
+      isDefault: true,
+      isActive: true,
+    });
+    if (!cashFund) {
+      throw new Error(
+        '❌ لا يوجد CashFund افتراضي. شغّل: npm run seed:finance'
+      );
+    }
 
-    // الأصناف والدفعات
+    const customer = await Customer.findOne({ isActive: true }).populate(
+      'assignedSalesRep',
+      'name'
+    );
+    if (!customer) {
+      throw new Error('❌ لا يوجد عملاء. شغّل: npm run seed:master');
+    }
+
     const stocks = await Stock.find({
       quantity: { $gt: 0 },
       isQuarantined: false,
@@ -183,25 +208,22 @@ async function main() {
 
     if (stocks.length < 3) {
       throw new Error(
-        `❌ عدد الدفعات المتاحة ${stocks.length} (نحتاج 3 على الأقل). استلم دفعات في المخزون أولاً.`
+        `❌ عدد الدفعات ${stocks.length} (نحتاج 3). شغّل npm run seed:master`
       );
     }
 
     logger.info(
-      `✅ المتطلبات جاهزة: admin=${admin.email}, rep=${salesRep.email}, customer=${customer.name}, stocks=${stocks.length}`
+      `✅ admin=${admin.email}, rep=${salesRep.email}, customer=${customer.name}, fund=${cashFund.name}, stocks=${stocks.length}`
     );
-
-    // ═══════════════════════════════════════════
-    // 3. بناء السيناريوهات
-    // ═══════════════════════════════════════════
 
     const now = new Date();
     const daysAgo = (n) => new Date(now.getTime() - n * 24 * 60 * 60 * 1000);
-    const daysFromNow = (n) => new Date(now.getTime() + n * 24 * 60 * 60 * 1000);
+    const daysFromNow = (n) =>
+      new Date(now.getTime() + n * 24 * 60 * 60 * 1000);
 
-    // ─────────────────────────────────────────────
-    // السيناريو 1: فاتورة نقدية (مدفوعة كلياً)
-    // ─────────────────────────────────────────────
+    // ═══════════════════════════════════════════════════════
+    // 1) فاتورة نقدية (paid)
+    // ═══════════════════════════════════════════════════════
     logger.info('💰 [1/5] فاتورة نقدية (paid)...');
 
     const stock1 = stocks[0];
@@ -218,7 +240,15 @@ async function main() {
       invoiceDate: daysAgo(5),
       items: [item1],
       subtotal: total1,
-      discount: { type: null, value: 0, computedAmount: 0, freeItems: [] },
+      discount: {
+        type: null,
+        value: 0,
+        reason: '',
+        approvedBy: null,
+        approvedAt: null,
+        computedAmount: 0,
+        freeItems: [],
+      },
       taxRate: 0,
       taxAmount: 0,
       total: total1,
@@ -227,9 +257,9 @@ async function main() {
       totalInstallments: 0,
       paidAmount: total1,
       remainingAmount: 0,
+      paidAt: daysAgo(5),
       paymentMethod: 'cash',
       status: INVOICE_STATUSES.PAID,
-      paidAt: daysAgo(5),
       commission: { rate: 0, amount: 0, isPaid: false },
       notes: 'فاتورة اختبار نقدية',
       createdBy: admin._id,
@@ -237,33 +267,28 @@ async function main() {
       finalizedAt: daysAgo(5),
     });
 
-    await CashTransaction.create({
-      transactionNumber: `CT-TEST-${Date.now()}-1`,
-      accountType: 'cash',
-      direction: 'in',
-      category: 'sale_cash',
+    await createTestCashTransaction({
       amount: total1,
       description: `دفعة نقدية للفاتورة ${invoice1.invoiceNumber}`,
-      referenceType: 'Invoice',
-      referenceId: invoice1._id,
-      party: customer._id,
-      partyType: 'Customer',
-      createdBy: admin._id,
+      invoiceId: invoice1._id,
+      cashFund,
+      admin,
     });
 
     logger.info(`   ✅ ${invoice1.invoiceNumber} — ${total1} SDG`);
 
-    // ─────────────────────────────────────────────
-    // السيناريو 2: فاتورة آجلة (pending)
-    // ─────────────────────────────────────────────
+    // ═══════════════════════════════════════════════════════
+    // 2) فاتورة آجلة (pending)
+    // ═══════════════════════════════════════════════════════
     logger.info('📅 [2/5] فاتورة آجلة (pending)...');
 
     const stock2 = stocks[1];
     const qty2 = Math.min(3, stock2.quantity);
     const unitPrice2 = stock2.unitPrice || 80;
     const item2 = buildInvoiceItem(stock2, qty2, unitPrice2);
-    const total2 = item2.total;
-    const dueDate2 = daysFromNow(30);
+    const subtotal2 = item2.total;
+    const discountAmount2 = Math.round(subtotal2 * 0.05 * 100) / 100;
+    const total2 = Math.round((subtotal2 - discountAmount2) * 100) / 100;
 
     const invoice2 = await Invoice.create({
       invoiceNumber: generateTestInvoiceNumber(2),
@@ -272,22 +297,24 @@ async function main() {
       warehouse: warehouse._id,
       invoiceDate: daysAgo(2),
       items: [item2],
-      subtotal: total2,
+      subtotal: subtotal2,
       discount: {
         type: 'percentage',
         value: 5,
         reason: 'عميل دائم',
-        computedAmount: Math.round(total2 * 0.05 * 100) / 100,
+        approvedBy: admin._id,
+        approvedAt: daysAgo(2),
+        computedAmount: discountAmount2,
         freeItems: [],
       },
       taxRate: 0,
       taxAmount: 0,
-      total: Math.round((total2 * 0.95) * 100) / 100,
+      total: total2,
       paymentType: 'credit',
-      dueDate: dueDate2,
+      dueDate: daysFromNow(30),
       totalInstallments: 0,
       paidAmount: 0,
-      remainingAmount: Math.round((total2 * 0.95) * 100) / 100,
+      remainingAmount: total2,
       paymentMethod: '',
       status: INVOICE_STATUSES.PENDING,
       commission: { rate: 0, amount: 0, isPaid: false },
@@ -297,17 +324,16 @@ async function main() {
       finalizedAt: daysAgo(2),
     });
 
-    // زيادة رصيد الصيدلية
     await Customer.updateOne(
       { _id: customer._id },
-      { $inc: { currentBalance: invoice2.total } }
+      { $inc: { currentBalance: total2 } }
     );
 
-    logger.info(`   ✅ ${invoice2.invoiceNumber} — ${invoice2.total} SDG (آجل)`);
+    logger.info(`   ✅ ${invoice2.invoiceNumber} — ${total2} SDG (آجل)`);
 
-    // ─────────────────────────────────────────────
-    // السيناريو 3: فاتورة أقساط (partial)
-    // ─────────────────────────────────────────────
+    // ═══════════════════════════════════════════════════════
+    // 3) فاتورة أقساط (partial)
+    // ═══════════════════════════════════════════════════════
     logger.info('💳 [3/5] فاتورة أقساط (partial)...');
 
     const stock3 = stocks[2];
@@ -316,6 +342,7 @@ async function main() {
     const item3 = buildInvoiceItem(stock3, qty3, unitPrice3);
     const total3 = item3.total;
     const firstInstallment = Math.round(total3 * 0.25 * 100) / 100;
+    const remaining3 = Math.round((total3 - firstInstallment) * 100) / 100;
 
     const invoice3 = await Invoice.create({
       invoiceNumber: generateTestInvoiceNumber(3),
@@ -325,7 +352,15 @@ async function main() {
       invoiceDate: daysAgo(10),
       items: [item3],
       subtotal: total3,
-      discount: { type: null, value: 0, computedAmount: 0, freeItems: [] },
+      discount: {
+        type: null,
+        value: 0,
+        reason: '',
+        approvedBy: null,
+        approvedAt: null,
+        computedAmount: 0,
+        freeItems: [],
+      },
       taxRate: 0,
       taxAmount: 0,
       total: total3,
@@ -333,7 +368,8 @@ async function main() {
       dueDate: daysFromNow(20),
       totalInstallments: 4,
       paidAmount: firstInstallment,
-      remainingAmount: Math.round((total3 - firstInstallment) * 100) / 100,
+      remainingAmount: remaining3,
+      paidAt: daysAgo(10),
       paymentMethod: 'cash',
       status: INVOICE_STATUSES.PARTIAL,
       commission: { rate: 0, amount: 0, isPaid: false },
@@ -343,30 +379,26 @@ async function main() {
       finalizedAt: daysAgo(10),
     });
 
-    await CashTransaction.create({
-      transactionNumber: `CT-TEST-${Date.now()}-3`,
-      accountType: 'cash',
-      direction: 'in',
-      category: 'customer_payment',
+    await createTestCashTransaction({
       amount: firstInstallment,
       description: `القسط الأول للفاتورة ${invoice3.invoiceNumber}`,
-      referenceType: 'Invoice',
-      referenceId: invoice3._id,
-      party: customer._id,
-      partyType: 'Customer',
-      createdBy: admin._id,
+      invoiceId: invoice3._id,
+      cashFund,
+      admin,
     });
 
     await Customer.updateOne(
       { _id: customer._id },
-      { $inc: { currentBalance: invoice3.remainingAmount } }
+      { $inc: { currentBalance: remaining3 } }
     );
 
-    logger.info(`   ✅ ${invoice3.invoiceNumber} — ${total3} SDG (قسط 1/4 مدفوع)`);
+    logger.info(
+      `   ✅ ${invoice3.invoiceNumber} — ${total3} SDG (قسط 1/4 مدفوع)`
+    );
 
-    // ─────────────────────────────────────────────
-    // السيناريو 4: مسودة (draft) — لم تُعتمد بعد
-    // ─────────────────────────────────────────────
+    // ═══════════════════════════════════════════════════════
+    // 4) مسودة (draft)
+    // ═══════════════════════════════════════════════════════
     logger.info('📝 [4/5] مسودة فاتورة (draft)...');
 
     const stock4 = stocks[0];
@@ -383,7 +415,15 @@ async function main() {
       invoiceDate: daysAgo(0),
       items: [item4],
       subtotal: total4,
-      discount: { type: null, value: 0, computedAmount: 0, freeItems: [] },
+      discount: {
+        type: null,
+        value: 0,
+        reason: '',
+        approvedBy: null,
+        approvedAt: null,
+        computedAmount: 0,
+        freeItems: [],
+      },
       taxRate: 0,
       taxAmount: 0,
       total: total4,
@@ -401,9 +441,9 @@ async function main() {
 
     logger.info(`   ✅ ${invoice4.invoiceNumber} — ${total4} SDG (مسودة)`);
 
-    // ─────────────────────────────────────────────
-    // السيناريو 5: مرتجع (pending)
-    // ─────────────────────────────────────────────
+    // ═══════════════════════════════════════════════════════
+    // 5) مرتجع (pending)
+    // ═══════════════════════════════════════════════════════
     logger.info('🔄 [5/5] مرتجع عميل (pending)...');
 
     const returnedQty = 1;
@@ -418,10 +458,11 @@ async function main() {
           item: returnedItem.item,
           batch: returnedItem.batch,
           quantity: returnedQty,
-          unit: '',
+          unit: 'وحدة',
           unitPrice: returnedItem.unitPrice,
-          total: Math.round(returnedQty * returnedItem.unitPrice * 100) / 100,
-          reason: 'damaged',
+          total:
+            Math.round(returnedQty * returnedItem.unitPrice * 100) / 100,
+          reason: RETURN_REASONS.DAMAGED,
           note: 'تلف أثناء النقل',
         },
       ],
@@ -437,35 +478,36 @@ async function main() {
       createdBy: admin._id,
     });
 
-    logger.info(`   ✅ ${testReturn.returnNumber} — ${testReturn.total} SDG (pending)`);
+    logger.info(
+      `   ✅ ${testReturn.returnNumber} — ${testReturn.total} SDG (pending)`
+    );
 
-    // ═══════════════════════════════════════════
-    // 4. الملخص
-    // ═══════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════
+    // الملخص
+    // ═══════════════════════════════════════════════════════
     logger.info('');
     logger.info('═══════════════════════════════════════════════');
     logger.info('🎉 اكتمل السكربت بنجاح!');
     logger.info('═══════════════════════════════════════════════');
     logger.info('');
     logger.info('📊 البيانات التجريبية المُنشأة:');
+    logger.info(
+      `  1. ${invoice1.invoiceNumber}  →  نقدي (مدفوعة)         →  ${invoice1.total} SDG`
+    );
+    logger.info(
+      `  2. ${invoice2.invoiceNumber}  →  آجل (معلقة)            →  ${invoice2.total} SDG`
+    );
+    logger.info(
+      `  3. ${invoice3.invoiceNumber}  →  أقساط (مدفوعة جزئياً)   →  ${invoice3.total} SDG`
+    );
+    logger.info(
+      `  4. ${invoice4.invoiceNumber}  →  مسودة (draft)           →  ${invoice4.total} SDG`
+    );
+    logger.info(
+      `  5. ${testReturn.returnNumber}  →  مرتجع (معلق)           →  ${testReturn.total} SDG`
+    );
     logger.info('');
-    logger.info(`  1. ${invoice1.invoiceNumber}  →  نقدي (مدفوعة)      →  ${invoice1.total} SDG`);
-    logger.info(`  2. ${invoice2.invoiceNumber}  →  آجل (معلقة)         →  ${invoice2.total} SDG`);
-    logger.info(`  3. ${invoice3.invoiceNumber}  →  أقساط (مدفوعة جزئياً) →  ${invoice3.total} SDG`);
-    logger.info(`  4. ${invoice4.invoiceNumber}  →  مسودة (draft)        →  ${invoice4.total} SDG`);
-    logger.info(`  5. ${testReturn.returnNumber}  →  مرتجع (معلق)        →  ${testReturn.total} SDG`);
-    logger.info('');
-    logger.info('🔍 للاختبار:');
-    logger.info('   GET  /api/invoices');
-    logger.info('   GET  /api/invoices?status=draft');
-    logger.info('   GET  /api/customer-returns');
-    logger.info('');
-    logger.info('💡 لاختبار الاعتماد (المسودة):');
-    logger.info(`   POST /api/invoices/${invoice4._id}/finalize`);
-    logger.info('   Body: { "paymentType": "cash" }');
-    logger.info('');
-    logger.info('⚠️  لمسح كل البيانات التجريبية:');
-    logger.info('   npm run seed:invoices   (سيُعيد المسح والإنشاء)');
+    logger.info(`💰 CashFund: ${cashFund.name} (${cashFund.code})`);
     logger.info('');
   } catch (error) {
     logger.error(`❌ فشل السكربت: ${error.message}`);
@@ -476,16 +518,9 @@ async function main() {
   }
 }
 
-// ============================================================
-// التشغيل
-// ============================================================
-
 main()
   .then(() => {
     logger.info('👋 تم إغلاق الاتصال بقاعدة البيانات.');
     process.exit(0);
   })
-  .catch((error) => {
-    logger.error(`💥 خطأ غير متوقع: ${error.message}`);
-    process.exit(1);
-  });
+  .catch(() => process.exit(1));

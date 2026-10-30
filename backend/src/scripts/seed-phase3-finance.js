@@ -1,21 +1,6 @@
 /**
  * @file seed-phase3-finance.js
- * @description
- * زرع بيانات Phase 3 (المالية) — **دفاعي**.
- *
- * ⚠️ لماذا دفاعي؟
- * - النماذج (CashFund, BankAccount, AccountingEntry) قد لا تكون موجودة في بعض النسخ.
- * - هذا السكربت يحاول استيرادها؛ إن فشل — يُسجّل تحذيراً ويكمل دون توقف.
- * - آمن للتشغيل حتى لو لم تكن Phase 3 مطبَّقة.
- *
- * يُنشئ (إن توفرت النماذج):
- *   - CashFund افتراضي (رصيد افتتاحي 0)
- *   - BankAccount واحد
- *   - بعض الحركات النقدية التجريبية
- *   - شيكات (pending / collected / bounced)
- *
- * التشغيل:
- *   cd backend && npm run seed:finance
+ * @description زرع بيانات Phase 3 (المالية) — دفاعي.
  */
 
 import { connectDatabase, disconnectDatabase } from '../config/database.js';
@@ -23,7 +8,7 @@ import { logger } from '../utils/logger.js';
 import { User, USER_ROLES } from '../models/User.js';
 
 // ─── محاولة استيراد نماذج Phase 3 (قد تفشل) ───
-let CashFund, BankAccount, Check, CashTransaction;
+let CashFund, BankAccount, Check, CashTransaction, Customer, Supplier;
 let phase3Available = true;
 
 try {
@@ -31,6 +16,19 @@ try {
   ({ BankAccount } = await import('../models/BankAccount.js'));
   ({ Check } = await import('../models/Check.js'));
   ({ CashTransaction } = await import('../models/CashTransaction.js'));
+  ({ Customer } = await import('../models/Customer.js'));
+  ({ Supplier } = await import('../models/Supplier.js'));
+
+  // تحقق فعلي من نجاح الاستيراد
+  if (
+    typeof CashFund?.create !== 'function' ||
+    typeof BankAccount?.create !== 'function' ||
+    typeof Check?.create !== 'function' ||
+    typeof CashTransaction?.create !== 'function'
+  ) {
+    phase3Available = false;
+    logger.warn('⚠️  Phase 3 models مستوردة لكن الدوال غير متاحة');
+  }
 } catch (err) {
   phase3Available = false;
   logger.warn(`⚠️  Phase 3 models غير متوفرة: ${err.message}`);
@@ -42,11 +40,8 @@ async function main() {
   logger.info('═══════════════════════════════════════════════');
 
   if (!phase3Available) {
-    logger.warn('');
-    logger.warn('⚠️  Phase 3 (CashFund / BankAccount / CashTransaction) غير مطبَّقة في الكود الحالي.');
-    logger.warn('   هذا السكربت سيتخطى الزرع بأمان.');
-    logger.warn('   لتفعيل Phase 3: أضف النماذج + server.js routes ثم أعد تشغيل.');
-    logger.warn('');
+    logger.warn('⚠️  Phase 3 غير مطبَّقة في الكود الحالي.');
+    logger.warn('   تخطي الزرع بأمان.');
     process.exit(0);
   }
 
@@ -62,9 +57,9 @@ async function main() {
       defaultFund = await CashFund.create({
         name: 'الصندوق الرئيسي',
         code: 'CF-MAIN',
-        description: 'الصندوق الافتراضي للشركة',
+        notes: 'الصندوق الافتراضي للشركة',
         openingBalance: 0,
-        balance: 0,
+        currentBalance: 0,
         isDefault: true,
         isActive: true,
         createdBy: admin._id,
@@ -74,18 +69,22 @@ async function main() {
       logger.info('   ℹ️  CashFund افتراضي موجود.');
     }
 
+    // ── تحقق من أن اسم الحقل الصحيح (قد يكون mainWarehouse في النموذج) ──
+    // defaultFund موجود بالفعل، لا حاجة لتعديله.
+
     // ─── BankAccount واحد ───
     let bankAccount = await BankAccount.findOne({ isActive: true });
     if (!bankAccount) {
       bankAccount = await BankAccount.create({
+        name: 'الحساب البنكي الرئيسي',
         bankName: 'بنك الخرطوم',
         accountNumber: '1234567890',
-        accountName: 'TOP PHARMA MEDICAL COMPANY',
-        branch: 'الفرع الرئيسي',
+        branchName: 'الفرع الرئيسي',
         currency: 'SDG',
         openingBalance: 0,
-        balance: 0,
+        currentBalance: 0,
         isActive: true,
+        isDefault: true,
         createdBy: admin._id,
       });
       logger.info('   ✅ BankAccount رئيسي.');
@@ -97,50 +96,58 @@ async function main() {
     const existingChecks = await Check.countDocuments();
     if (existingChecks === 0) {
       const baseDate = new Date();
-      const addDays = (n) => new Date(baseDate.getTime() + n * 24 * 60 * 60 * 1000);
+      const addDays = (n) =>
+        new Date(baseDate.getTime() + n * 24 * 60 * 60 * 1000);
 
-      await Check.create([
-        {
+      const customer = Customer
+        ? await Customer.findOne({ isActive: true }).lean()
+        : null;
+      const supplier = Supplier
+        ? await Supplier.findOne({ isActive: true }).lean()
+        : null;
+
+      const checksToCreate = [];
+
+      if (customer) {
+        checksToCreate.push({
           checkNumber: 'CHK-IN-001',
           type: 'incoming',
           amount: 5000,
           bankName: 'بنك فيصل',
           issueDate: addDays(-5),
           dueDate: addDays(10),
-          drawerName: 'صيدلية النور',
+          customerId: customer._id,
           status: 'pending',
           createdBy: admin._id,
-        },
-        {
-          checkNumber: 'CHK-IN-002',
-          type: 'incoming',
-          amount: 3500,
-          bankName: 'بنك الخرطوم',
-          issueDate: addDays(-10),
-          dueDate: addDays(3),
-          drawerName: 'صيدلية الشفاء',
-          status: 'pending',
-          createdBy: admin._id,
-        },
-        {
+        });
+      }
+
+      if (supplier) {
+        checksToCreate.push({
           checkNumber: 'CHK-OUT-001',
           type: 'outgoing',
           amount: 8000,
           bankName: 'بنك أم درمان',
           issueDate: addDays(-20),
           dueDate: addDays(-2),
-          drawerName: 'شركة الجزيرة للأدوية',
+          supplierId: supplier._id,
           status: 'pending',
           createdBy: admin._id,
-        },
-      ]);
-      logger.info('   ✅ 3 شيكات تجريبية.');
+        });
+      }
+
+      if (checksToCreate.length > 0) {
+        await Check.create(checksToCreate);
+        logger.info(`   ✅ ${checksToCreate.length} شيك تجريبي.`);
+      } else {
+        logger.warn('   ⚠️  لا يوجد عملاء/موردين — تخطي الشيكات.');
+      }
     } else {
       logger.info(`   ℹ️  ${existingChecks} شيك موجود بالفعل.`);
     }
 
     logger.info('');
-    logger.info('🎉 اكتمل Phase 3 Finance Seed (بشكل دفاعي).');
+    logger.info('🎉 اكتمل Phase 3 Finance Seed.');
     logger.info('');
   } catch (error) {
     logger.error(`❌ فشل: ${error.message}`);

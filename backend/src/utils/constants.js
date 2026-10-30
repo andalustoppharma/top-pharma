@@ -1,12 +1,10 @@
 /**
  * @file constants.js
  * @description
- * الثوابت المشتركة في التطبيق — Phase 0 + 1 + 2 + 2.5 + 3.
+ * الثوابت المشتركة في التطبيق — Phase 0-5.
  *
- * لماذا هذا الملف؟
- * - نُوحّد قيم enum/status في مكان واحد (بلا magic strings).
- * - يُستخدم في Controllers/Services/Jobs.
- * - يمنع أخطاء الكتابة (typos) في status/action/etc.
+ * ⚠️ AUDIT_ACTIONS يُعاد تصديره من models/AuditLog.js
+ *    (المصدر الوحيد للحقيقة — يمنع الازدواجية).
  *
  * المبادئ:
  *  - كل ثابت مجمّد (Object.freeze) — لا تعديل.
@@ -16,28 +14,17 @@
 /* ─────────────────────────────────────────────────────────────
  * 1) سجل التدقيق (Audit Log)
  * ─────────────────────────────────────────────────────────────
- * action: نوع العملية (يُستخدم في logAuditEvent).
+ * ⚠️ لا نُعرّف AUDIT_ACTIONS محلياً — نستورده من AuditLog.js
+ *    ثم نُعيد تصديره. هذا يضمن تطابقاً حرفياً مع enum في الموديل
+ *    (الذي يرفض أي قيمة غير معروفة عند الحفظ في MongoDB).
+ *
+ * ⚠️ لماذا import + export بدلاً من export { X } from '...'؟
+ *    لأن الصيغة المختصرة (re-export) لا تُنشئ ربطاً محلياً، فلا
+ *    يمكن استخدام AUDIT_ACTIONS داخل التصدير الافتراضي في نهاية
+ *    الملف (سيرمي ReferenceError).
  */
-export const AUDIT_ACTIONS = Object.freeze({
-  CREATE: 'CREATE',
-  UPDATE: 'UPDATE',
-  DELETE: 'DELETE',
-  LOGIN: 'LOGIN',
-  LOGOUT: 'LOGOUT',
-  LOGIN_FAILED: 'LOGIN_FAILED',
-  PASSWORD_RESET: 'PASSWORD_RESET',
-  PASSWORD_CHANGE: 'PASSWORD_CHANGE',
-  APPROVE: 'APPROVE',
-  REJECT: 'REJECT',
-  CANCEL: 'CANCEL',
-  FINALIZE: 'FINALIZE',
-  PAYMENT: 'PAYMENT',
-  TRANSFER: 'TRANSFER',
-  ADJUST: 'ADJUST',
-  REVERSE: 'REVERSE',
-  EXPORT: 'EXPORT',
-  IMPORT: 'IMPORT',
-});
+import { AUDIT_ACTIONS } from '../models/AuditLog.js';
+export { AUDIT_ACTIONS };
 
 /* ─────────────────────────────────────────────────────────────
  * 2) أكواد الأدوار (Role Codes)
@@ -210,19 +197,32 @@ export const ACCOUNTING_ENTRY_TYPES = Object.freeze({
 /* ─────────────────────────────────────────────────────────────
  * 13) أنواع الإشعارات (Notification Types)
  * ─────────────────────────────────────────────────────────────
+ * ⚠️ يجب أن تطابق models/Notification.js NOTIFICATION_TYPES حرفياً.
+ * ⚠️ في Jobs استخدم الاستيراد من models/Notification.js مباشرة.
+ * ⚠️ هذا موجود للاستخدام العام فقط (display, filtering).
  */
 export const NOTIFICATION_TYPES = Object.freeze({
-  EXPIRY_SOON: 'expiry_soon',
-  LOW_STOCK: 'low_stock',
+  STOCK_LOW: 'stock_low',
+  STOCK_EXPIRING: 'stock_expiring',
+  STOCK_EXPIRED: 'stock_expired',
   INVOICE_DUE: 'invoice_due',
-  CHECK_DUE_SOON: 'check_due_soon',
-  CHECK_DUE_TODAY: 'check_due_today',
+  INVOICE_OVERDUE: 'invoice_overdue',
+  CHECK_DUE: 'check_due',
   CHECK_OVERDUE: 'check_overdue',
-  PRICE_OVERRIDE: 'price_override',
+  RETURN_GRACE_WARNING: 'return_grace_warning',
+  SALES_REP_SETTLEMENT: 'sales_rep_settlement',
+  ACCOUNT_LOCKED: 'account_locked',
+  SYSTEM: 'system',
+});
+
+export const NOTIFICATION_LEVELS = Object.freeze({
+  INFO: 'info',
+  WARNING: 'warning',
+  DANGER: 'danger',
 });
 
 /* ─────────────────────────────────────────────────────────────
- * 14) أنواع الدفعات (Stock Batch)
+ * 14) أنواع المخازن (Warehouse Types)
  * ─────────────────────────────────────────────────────────────
  */
 export const WAREHOUSE_TYPES = Object.freeze({
@@ -242,7 +242,7 @@ export const ROUNDING_TOLERANCE = 0.01;
  * ─────────────────────────────────────────────────────────────
  */
 export default {
-  AUDIT_ACTIONS,
+  AUDIT_ACTIONS,       // ← الآن يعمل (binding محلي موجود من import)
   ROLE_CODES,
   INVOICE_STATUS,
   CHECK_STATUS,
@@ -260,6 +260,7 @@ export default {
   DELIVERY_NOTE_STATUS,
   ACCOUNTING_ENTRY_TYPES,
   NOTIFICATION_TYPES,
+  NOTIFICATION_LEVELS,
   WAREHOUSE_TYPES,
   CURRENCY,
   ROUNDING_TOLERANCE,

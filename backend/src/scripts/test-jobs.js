@@ -3,18 +3,12 @@
  * @description
  * سكربت اختبار يدوي لكل Jobs (بدون انتظار Cron).
  *
- * لماذا هذا الملف؟
- * - يسمح بتشغيل Jobs فوراً في التطوير والاختبار.
- * - يُظهر عدد الإشعارات والإيميلات المُنشأة.
- * - لا يُعدّل الجدولة — فقط يُشغّل المهام.
- *
- * التشغيل:
- *   cd backend && npm run test-jobs
- *
- * أو لتشغيل Job واحد:
- *   node src/scripts/test-jobs.js expiry
- *   node src/scripts/test-jobs.js reorder
- *   node src/scripts/test-jobs.js invoices
+ * Jobs المُختبَرة:
+ *  - expiry       → expiryAlert
+ *  - reorder      → reorderAlert
+ *  - invoices     → invoiceDueAlert
+ *  - checks       → checkDueAlert (Phase 5)
+ *  - backup       → autoBackup (Phase 5.5)
  */
 
 import { connectDatabase, disconnectDatabase } from '../config/database.js';
@@ -23,18 +17,21 @@ import { logger } from '../utils/logger.js';
 import { runExpiryAlert } from '../jobs/expiryAlert.js';
 import { runReorderAlert } from '../jobs/reorderAlert.js';
 import { runInvoiceDueAlert } from '../jobs/invoiceDueAlert.js';
+import runCheckDueAlert from '../jobs/checkDueAlert.js';
+import { runAutoBackup } from '../jobs/autoBackup.js';
 
 const JOBS = {
   expiry: { name: 'expiryAlert', fn: runExpiryAlert, icon: '🔔' },
   reorder: { name: 'reorderAlert', fn: runReorderAlert, icon: '📦' },
   invoices: { name: 'invoiceDueAlert', fn: runInvoiceDueAlert, icon: '💰' },
+  checks: { name: 'checkDueAlert', fn: runCheckDueAlert, icon: '📋' },
+  backup: { name: 'autoBackup', fn: runAutoBackup, icon: '💾' },
 };
 
 async function main() {
   const jobKey = process.argv[2];
   const jobsToRun = jobKey ? [jobKey] : Object.keys(JOBS);
 
-  // التحقق من صحة الاسم
   if (jobKey && !JOBS[jobKey]) {
     logger.error(`❌ Job غير معروف: ${jobKey}`);
     logger.info(`المتاح: ${Object.keys(JOBS).join(', ')}`);
@@ -61,14 +58,16 @@ async function main() {
         logger.info(`✅ [${job.name}] اكتمل في ${duration}ms`);
       } catch (error) {
         const duration = Date.now() - startTime;
-        results.push({ name: job.name, success: false, error: error.message, duration });
+        results.push({
+          name: job.name,
+          success: false,
+          error: error.message,
+          duration,
+        });
         logger.error(`❌ [${job.name}] فشل في ${duration}ms: ${error.message}`);
       }
     }
 
-    // ═══════════════════════════════════════════════
-    // الملخص
-    // ═══════════════════════════════════════════════
     logger.info('\n═══════════════════════════════════════════════');
     logger.info('📊 ملخص الاختبار');
     logger.info('═══════════════════════════════════════════════');

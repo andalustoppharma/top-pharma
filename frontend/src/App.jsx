@@ -1,30 +1,19 @@
 /**
  * @file App.jsx
- * @description المكون الجذر للتطبيق
+ * @description المكون الجذر للتطبيق.
  *
- * لماذا هذا الملف:
- * - يستدعي AppRoutes.
- * - يعرض ToastContainer (حاوية الإشعارات).
- * - لا يحتوي على منطق (كل شيء في Routes).
+ * ⚠️ ToastContainer موجود في Layout.jsx (وليس هنا) —
+ *    لتجنب التكرار (ظهور كل Toast مرتين).
  */
 
 import AppRoutes from './routes/AppRoutes.jsx';
-import ToastContainer from './components/UI/ToastContainer.jsx';
 
 /**
  * المكون الجذر
  * @returns {JSX.Element}
  */
 function App() {
-  return (
-    <>
-      {/* ✅ المسارات */}
-      <AppRoutes />
-
-      {/* ✅ حاوية الإشعارات (ثابتة في الزاوية) */}
-      <ToastContainer />
-    </>
-  );
+  return <AppRoutes />;
 }
 
 export default App;

@@ -1,11 +1,10 @@
 /**
  * @file constants.js
- * @description الثوابت العامة للتطبيق
+ * @description الثوابت العامة للتطبيق.
  *
- * لماذا هذا الملف:
- * - مكان واحد للثوابت.
- * - يمنع التكرار.
- * - يسهّل الصيانة.
+ * ⚠️ Phase D (2026-10-30):
+ * - ROLES + ROLE_LABELS_AR يشملان hr_manager.
+ * - تحقق من تطابق أي إضافة مستقبلية مع Role.code في Backend.
  */
 
 // ═══════════════════════════════════════════════
@@ -20,10 +19,11 @@ export const STORAGE_KEYS = Object.freeze({
 });
 
 // ═══════════════════════════════════════════════
-// 2. الأدوار (Roles)
+// 2. الأدوار (Roles) — 6 أدوار (Phase D)
 // ═══════════════════════════════════════════════
 export const ROLES = Object.freeze({
   ADMIN: 'admin',
+  HR_MANAGER: 'hr_manager',
   STOREKEEPER: 'storekeeper',
   ACCOUNTANT: 'accountant',
   SALES_REP: 'sales_rep',
@@ -32,6 +32,7 @@ export const ROLES = Object.freeze({
 
 export const ROLE_LABELS_AR = Object.freeze({
   admin: 'مدير',
+  hr_manager: 'مدير موارد بشرية',
   storekeeper: 'أمين مخزن',
   accountant: 'محاسب',
   sales_rep: 'مندوب',
@@ -110,14 +111,14 @@ export const CHECK_TYPES = Object.freeze({
 
 export const CHECK_STATUSES = Object.freeze({
   PENDING: 'pending',
-  COLLECTED: 'collected',
+  PAID: 'paid',
   BOUNCED: 'bounced',
   CANCELLED: 'cancelled',
 });
 
 export const CHECK_STATUS_LABELS_AR = Object.freeze({
   pending: 'معلّق',
-  collected: 'تم التحصيل',
+  paid: 'مدفوع',
   bounced: 'مرتجع',
   cancelled: 'ملغى',
 });
@@ -193,7 +194,7 @@ export const PAGINATION = Object.freeze({
 export const CURRENCY = Object.freeze({
   CODE: 'SDG',
   SYMBOL: 'SDG',
-  LOCALE: 'en-US', // أرقام إنجليزية
+  LOCALE: 'en-US',
   DECIMALS: 2,
 });
 
@@ -202,7 +203,7 @@ export const DATE_FORMAT = Object.freeze({
   LONG: 'yyyy-MM-dd HH:mm',
   DISPLAY: 'dd/MM/yyyy',
   DISPLAY_LONG: 'dd/MM/yyyy HH:mm',
-  LOCALE: 'en-GB', // ميلادي
+  LOCALE: 'en-GB',
 });
 
 // ═══════════════════════════════════════════════
@@ -234,7 +235,56 @@ export const MESSAGES = Object.freeze({
 });
 
 // ═══════════════════════════════════════════════
-// 15. تصدير افتراضي (للاستخدام الجماعي)
+// 15. الإشعارات (Notifications) — Phase 5
+// ═══════════════════════════════════════════════
+export const NOTIFICATION_TYPES = Object.freeze({
+  STOCK_LOW: 'stock_low',
+  STOCK_EXPIRING: 'stock_expiring',
+  STOCK_EXPIRED: 'stock_expired',
+  INVOICE_DUE: 'invoice_due',
+  INVOICE_OVERDUE: 'invoice_overdue',
+  CHECK_DUE: 'check_due',
+  CHECK_OVERDUE: 'check_overdue',
+  RETURN_GRACE_WARNING: 'return_grace_warning',
+  SALES_REP_SETTLEMENT: 'sales_rep_settlement',
+  ACCOUNT_LOCKED: 'account_locked',
+  SYSTEM: 'system',
+});
+
+export const NOTIFICATION_LEVELS = Object.freeze({
+  INFO: 'info',
+  WARNING: 'warning',
+  DANGER: 'danger',
+});
+
+export const NOTIFICATION_TYPE_LABELS_AR = Object.freeze({
+  stock_low: 'حد أدنى للمخزون',
+  stock_expiring: 'دفعة قاربة الانتهاء',
+  stock_expired: 'دفعة منتهية',
+  invoice_due: 'فاتورة مستحقة',
+  invoice_overdue: 'فاتورة متأخرة',
+  check_due: 'شيك مستحق',
+  check_overdue: 'شيك متأخر',
+  return_grace_warning: 'تحذير مهلة الإرجاع',
+  sales_rep_settlement: 'تسوية مندوب',
+  account_locked: 'حساب مقفل',
+  system: 'إشعار نظام',
+});
+
+export const NOTIFICATION_LEVEL_LABELS_AR = Object.freeze({
+  info: 'معلومة',
+  warning: 'تحذير',
+  danger: 'خطر',
+});
+
+export const NOTIFICATION_LEVEL_BADGE = Object.freeze({
+  info: 'bg-primary-100 text-primary-800',
+  warning: 'bg-warning-100 text-warning-800',
+  danger: 'bg-danger-100 text-danger-800',
+});
+
+// ═══════════════════════════════════════════════
+// 16. تصدير افتراضي
 // ═══════════════════════════════════════════════
 export default {
   STORAGE_KEYS,
@@ -260,4 +310,9 @@ export default {
   DATE_FORMAT,
   VALIDATION,
   MESSAGES,
+  NOTIFICATION_TYPES,
+  NOTIFICATION_LEVELS,
+  NOTIFICATION_TYPE_LABELS_AR,
+  NOTIFICATION_LEVEL_LABELS_AR,
+  NOTIFICATION_LEVEL_BADGE,
 };

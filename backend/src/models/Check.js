@@ -11,6 +11,13 @@
 
 import mongoose from 'mongoose';
 
+export const CHECK_STATUSES = Object.freeze({
+  PENDING: 'pending',
+  PAID: 'paid',
+  BOUNCED: 'bounced',
+  CANCELLED: 'cancelled',
+});
+
 const checkSchema = new mongoose.Schema(
   {
     // ─── معلومات الشيك الأساسية ───
@@ -177,6 +184,6 @@ checkSchema.virtual('daysUntilDue').get(function () {
 checkSchema.set('toJSON', { virtuals: true });
 checkSchema.set('toObject', { virtuals: true });
 
-const Check = mongoose.model('Check', checkSchema);
+export const Check = mongoose.model('Check', checkSchema);
 
 export default Check;

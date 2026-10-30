@@ -19,14 +19,15 @@ import { logger } from '../utils/logger.js';
  */
 export const getDashboard = async (req, res, next) => {
   try {
-    const data = await getDashboardData({
-      req,
-      period: req.query.period,
-      from: req.query.from,
-      to: req.query.to,
-      trendDays: req.query.trendDays,
-      lowStockLimit: req.query.lowStockLimit,
-    });
+const q = req.validatedQuery || req.query;
+const data = await getDashboardData({
+  req,
+  period: q.period,
+  from: q.from,
+  to: q.to,
+  trendDays: q.trendDays,
+  lowStockLimit: q.lowStockLimit,
+});
 
     res.status(200).json({
       success: true,
@@ -44,14 +45,15 @@ export const getDashboard = async (req, res, next) => {
  */
 export const getDashboardSummary = async (req, res, next) => {
   try {
-    const data = await getDashboardData({
-      req,
-      period: req.query.period,
-      from: req.query.from,
-      to: req.query.to,
-      trendDays: 7,
-      lowStockLimit: 1,
-    });
+const q = req.validatedQuery || req.query;
+const data = await getDashboardData({
+  req,
+  period: q.period,
+  from: q.from,
+  to: q.to,
+  trendDays: 7,
+  lowStockLimit: 1,
+});
 
     res.status(200).json({
       success: true,

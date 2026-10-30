@@ -37,6 +37,11 @@ export const CASH_TRANSACTION_REFERENCE_TYPES = Object.freeze([
   'expense',           // مصروف
 ]);
 
+export const CASH_DIRECTIONS = Object.freeze({
+  IN: 'in',
+  OUT: 'out',
+});
+
 /**
  * Schema الحركة النقدية.
  */

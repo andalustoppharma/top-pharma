@@ -90,6 +90,7 @@ const roleSchema = z.enum(
     USER_ROLES.ACCOUNTANT,
     USER_ROLES.SALES_REP,
     USER_ROLES.PHARMACY,
+    USER_ROLES.HR_MANAGER,
   ],
   {
     errorMap: () => ({ message: 'دور غير معتمد.' }),

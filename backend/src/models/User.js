@@ -29,6 +29,7 @@ export const USER_ROLES = Object.freeze({
   ACCOUNTANT: 'accountant',
   SALES_REP: 'sales_rep',
   PHARMACY: 'pharmacy',
+  HR_MANAGER: 'hr_manager',
 });
 
 /**

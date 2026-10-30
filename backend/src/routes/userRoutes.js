@@ -45,7 +45,7 @@ router.use(requireAuth);
  */
 router.get(
   '/',
-  requirePermissions('users.read'),
+  requirePermissions('users.view'),
   validate(listUsersQuerySchema, 'query'),
   listUsers
 );
@@ -73,7 +73,7 @@ router.patch(
  */
 router.post(
   '/:id/reset-password',
-  requirePermissions('users.update'),
+  requirePermissions('users.reset_password'),
   validate(userIdParamsSchema, 'params'),
   validate(adminResetPasswordSchema),
   adminResetPassword
@@ -84,10 +84,9 @@ router.post(
  */
 router.get(
   '/:id',
-  requirePermissions('users.read'),
+  requirePermissions('users.view'),
   validate(userIdParamsSchema, 'params'),
-  getUser
-);
+  getUser);
 
 /**
  * PATCH /api/users/:id

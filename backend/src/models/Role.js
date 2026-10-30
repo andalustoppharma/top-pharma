@@ -101,7 +101,7 @@ const roleSchema = new Schema(
       unique: true,
       trim: true,
       lowercase: true,
-      enum: ['admin', 'storekeeper', 'accountant', 'sales_rep', 'pharmacy'],
+      enum: ['admin', 'storekeeper', 'accountant', 'sales_rep', 'pharmacy', 'hr_manager'],
     },
 
     /**
@@ -147,9 +147,7 @@ const roleSchema = new Schema(
 );
 
 /**
- * فهرس الكود.
- */
-roleSchema.index({ code: 1 }, { unique: true });
+ 
 
 /**
  * التحقق من أن كل الصلاحيات معروفة.
@@ -249,6 +247,23 @@ export const DEFAULT_ROLES = Object.freeze([
       'finance.entries.view',
       'finance.transactions.view',
       // ⚠️ بدون finance.entries.manage — القيود تلقائية فقط
+    ],
+  },
+    {
+    code: 'hr_manager',
+    name: 'مدير موارد بشرية',
+    description: 'إدارة الموظفين والمستخدمين فقط (بدون مالية، بدون مخزون، بدون مبيعات)',
+    isSystem: true,
+    permissions: [
+      'users.view',
+      'users.create',
+      'users.update',
+      'users.delete',
+      'users.reset_password',
+      'roles.view',
+      'notifications.view',
+      'audit_logs.view',
+      'settings.view',
     ],
   },
   {

@@ -18,18 +18,17 @@ import { dashboardQuerySchema } from '../validators/dashboardValidator.js';
 const router = Router();
 
 router.use(requireAuth);
-router.use(requirePermissions('reports.read'));
+router.use(requirePermissions('reports.view'));
 
 /**
  * GET /api/dashboard
  * كامل بيانات الداشبورد (KPIs + رسوم + جداول).
  */
-router.get('/', validate(dashboardQuerySchema), getDashboard);
+router.get('/', validate(dashboardQuerySchema, 'query'), getDashboard);
 
 /**
  * GET /api/dashboard/summary
  * KPIs فقط.
  */
-router.get('/summary', validate(dashboardQuerySchema), getDashboardSummary);
-
+router.get('/summary', validate(dashboardQuerySchema, 'query'), getDashboardSummary);
 export default router;

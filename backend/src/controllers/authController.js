@@ -4,14 +4,8 @@
  * منطق المصادقة: تسجيل الدخول/الخروج، تجديد التوكن، تغيير كلمة المرور،
  * واسترداد كلمة المرور عبر البريد.
  *
- * لماذا هذا الملف؟
- * - نُركّز كل منطق Auth في مكان واحد لتفادي التسريب إلى routes.
- * - نستخدم AppError للأخطاء المتوقعة (401/403/404/409).
- * - نستخدم asyncHandler لتغليف الدوال غير المتزامنة.
- * - نُسجّل الأحداث الحساسة في AuditLog عبر logAuditEvent.
- * - لا نُعيد كلمة المرور أو التوكنات في أي رسالة خطأ.
- * - نستخدم crypto لتوليد توكنات عشوائية آمنة عند الحاجة.
- * - مقاومة enumeration: رسائل موحّدة لـ login و forgotPassword.
+ * ⚠️ B1 (Phase B): يُرجع permissions مع user في login + me
+ *    لدعم hasPermission في الواجهة (RBAC على مستوى Frontend).
  */
 
 import crypto from 'crypto';
@@ -20,6 +14,7 @@ import jwt from 'jsonwebtoken';
 
 import { env } from '../config/env.js';
 import { AUDIT_ACTIONS } from '../models/AuditLog.js';
+import { Role } from '../models/Role.js';                 // ← B1 جديد
 import { User } from '../models/User.js';
 import { AppError, asyncHandler } from '../middlewares/errorMiddleware.js';
 import { logAuditEvent } from '../middlewares/auditLogMiddleware.js';
@@ -27,24 +22,42 @@ import { sendPasswordResetEmail } from '../utils/email.js';
 import { generateTokenPair, verifyRefreshToken } from '../utils/jwt.js';
 import { hashPassword, verifyPassword } from '../utils/password.js';
 
-/**
- * مدة صلاحية توكن إعادة تعيين كلمة المرور (بالدقائق).
- * 30 دقيقة — كافية للمستخدم، وقصيرة للأمان.
- */
 const RESET_TOKEN_TTL_MINUTES = 30;
-
-/**
- * سرّ خاص لتوقيع توكن إعادة التعيين.
- * نستخدم JWT_REFRESH_SECRET كمصدر (لا نضيف متغيراً جديداً لتفادي التعقيد).
- */
 const RESET_TOKEN_SECRET = env.JWT_REFRESH_SECRET;
 
 /**
- * بناء استجابة موحّدة للمستخدم (بلا حقول حساسة).
+ * جلب صلاحيات الدور من قاعدة البيانات.
+ *
+ * - admin → ['*'] (يملك كل شيء ضمناً)
+ * - غير ذلك → Role.permissions (أو [] إن لم يوجد الدور)
+ * - fail-safe: أي خطأ → [] (لا صلاحيات)
+ *
+ * @param {string} roleName - يطابق Role.code (وليس Role.name)
+ * @returns {Promise<string[]>}
+ */
+const getRolePermissions = async (roleName) => {
+  if (!roleName) return [];
+  if (roleName === 'admin') return ['*'];
+  try {
+    // ⚠️ نستعلم بـ code (وليس name) — لأن User.role يطابق Role.code
+    // Role لا يحتوي isActive — نتجاهله
+    const role = await Role.findOne({ code: roleName }).select('permissions').lean();
+    return Array.isArray(role?.permissions) ? role.permissions : [];
+  } catch {
+    return [];
+  }
+};
+
+/**
+ * بناء استجابة موحّدة للمستخدم.
+ *
+ * ⚠️ B1: يُضاف حقل permissions (افتراضياً [] للحفاظ على التوافق).
+ *
  * @param {import('mongoose').Document} user
+ * @param {string[]} [permissions=[]]
  * @returns {Object}
  */
-const buildUserPayload = (user) => ({
+const buildUserPayload = (user, permissions = []) => ({
   id: user._id,
   name: user.name,
   email: user.email,
@@ -54,22 +67,18 @@ const buildUserPayload = (user) => ({
   linkedEntity: user.linkedEntity || { type: null, id: null },
   mustChangePassword: user.mustChangePassword || false,
   lastLoginAt: user.lastLoginAt || null,
+  permissions,                                            // ← B1 جديد
 });
 
 /**
  * POST /api/auth/login
- * تسجيل دخول بالبريد وكلمة المرور.
- *
- * @type {import('express').RequestHandler}
  */
 export const login = asyncHandler(async (req, res) => {
   const { email, password } = req.body;
 
-  // نُجلب المستخدم مع كلمة المرور (select: false افتراضياً).
   const user = await User.findOne({ email }).select('+password');
 
   if (!user) {
-    // لا نكشف إن كان البريد موجوداً أو لا (مقاومة enumeration).
     await logAuditEvent({
       req,
       action: AUDIT_ACTIONS.LOGIN_FAILED,
@@ -84,7 +93,6 @@ export const login = asyncHandler(async (req, res) => {
     );
   }
 
-  // فحص حالة القفل المؤقت.
   if (user.isLocked()) {
     await logAuditEvent({
       req,
@@ -101,7 +109,6 @@ export const login = asyncHandler(async (req, res) => {
     );
   }
 
-  // فحص كلمة المرور.
   const isMatch = await verifyPassword(password, user.password);
 
   if (!isMatch) {
@@ -117,7 +124,6 @@ export const login = asyncHandler(async (req, res) => {
       success: false,
     });
 
-    // إذا قُفل الحساب للتو، نُسجّل الحدث.
     if (user.isLocked()) {
       await logAuditEvent({
         req,
@@ -136,26 +142,21 @@ export const login = asyncHandler(async (req, res) => {
     );
   }
 
-  // فحص حالة الحساب.
   if (!user.isActive) {
     throw new AppError('الحساب معطّل. تواصل مع الإدارة.', 403, 'ACCOUNT_DISABLED');
   }
 
-  // نجاح: إعادة ضبط العدّاد + تحديث lastLogin.
   user.resetLoginAttempts();
   user.lastLoginAt = new Date();
   user.lastLoginIp = req.ip || '';
   await user.save();
 
-  // توليد التوكنات.
   const { accessToken, refreshToken } = generateTokenPair({
     userId: user._id,
     role: user.role,
     tokenVersion: user.tokenVersion,
   });
 
-  // ✅ الإصلاح: نُرفق المستخدم بالطلب الأصلي بدل تفكيك req بـ spread.
-  // تفكيك req (...req) يفقد خصائص مثل headers و socket، ويُسبب خطأ في getClientIp.
   req.user = user;
 
   await logAuditEvent({
@@ -167,10 +168,13 @@ export const login = asyncHandler(async (req, res) => {
     success: true,
   });
 
+  // ⚠️ B1: جلب الصلاحيات قبل الاستجابة
+  const permissions = await getRolePermissions(user.role);
+
   return res.status(200).json({
     success: true,
     data: {
-      user: buildUserPayload(user),
+      user: buildUserPayload(user, permissions),          // ← B1: مرّر permissions
       accessToken,
       refreshToken,
     },
@@ -179,10 +183,6 @@ export const login = asyncHandler(async (req, res) => {
 
 /**
  * POST /api/auth/logout
- * تسجيل خروج (لا يفعل شيئاً على السيرفر — الـ client يحذف التوكنات).
- * نُسجّل الحدث في AuditLog فقط.
- *
- * @type {import('express').RequestHandler}
  */
 export const logout = asyncHandler(async (req, res) => {
   await logAuditEvent({
@@ -202,10 +202,6 @@ export const logout = asyncHandler(async (req, res) => {
 
 /**
  * POST /api/auth/refresh
- * تجديد Access Token باستخدام Refresh Token.
- * لا يحتاج Access Token صالح (لأنه قد يكون منتهياً).
- *
- * @type {import('express').RequestHandler}
  */
 export const refresh = asyncHandler(async (req, res) => {
   const { refreshToken } = req.body;
@@ -264,9 +260,6 @@ export const refresh = asyncHandler(async (req, res) => {
 
 /**
  * GET /api/auth/me
- * إرجاع بيانات المستخدم الحالي.
- *
- * @type {import('express').RequestHandler}
  */
 export const me = asyncHandler(async (req, res) => {
   const user = await User.findById(req.user._id).select(
@@ -277,17 +270,17 @@ export const me = asyncHandler(async (req, res) => {
     throw new AppError('الحساب غير موجود.', 404, 'USER_NOT_FOUND');
   }
 
+  // ⚠️ B1: جلب الصلاحيات
+  const permissions = await getRolePermissions(user.role);
+
   return res.status(200).json({
     success: true,
-    data: buildUserPayload(user),
+    data: buildUserPayload(user, permissions),              // ← B1
   });
 });
 
 /**
  * PATCH /api/auth/change-password
- * تغيير كلمة المرور (مع إبطال كل الجلسات الحالية).
- *
- * @type {import('express').RequestHandler}
  */
 export const changePassword = asyncHandler(async (req, res) => {
   const { currentPassword, newPassword } = req.body;
@@ -327,16 +320,12 @@ export const changePassword = asyncHandler(async (req, res) => {
 
 /**
  * POST /api/auth/forgot-password
- * إرسال رابط استرداد كلمة المرور (يُرسل دائماً 200 حتى لو البريد غير موجود).
- *
- * @type {import('express').RequestHandler}
  */
 export const forgotPassword = asyncHandler(async (req, res) => {
   const { email } = req.body;
 
   const user = await User.findOne({ email, isActive: true });
 
-  // رد موحّد دائماً (مقاومة enumeration).
   const genericResponse = {
     success: true,
     data: {
@@ -348,7 +337,6 @@ export const forgotPassword = asyncHandler(async (req, res) => {
     return res.status(200).json(genericResponse);
   }
 
-  // توليد توكن JWT قصير العمر لإعادة التعيين.
   const resetToken = jwt.sign(
     { sub: String(user._id), purpose: 'password-reset' },
     RESET_TOKEN_SECRET,
@@ -378,18 +366,13 @@ export const forgotPassword = asyncHandler(async (req, res) => {
 
 /**
  * POST /api/auth/reset-password
- * إعادة تعيين كلمة المرور باستخدام التوكن.
- *
- * @type {import('express').RequestHandler}
  */
 export const resetPassword = asyncHandler(async (req, res) => {
   const { token, newPassword } = req.body;
 
   let payload;
   try {
-    payload = jwt.verify(token, RESET_TOKEN_SECRET, {
-      issuer: 'pharma-system',
-    });
+    payload = jwt.verify(token, RESET_TOKEN_SECRET, { issuer: 'pharma-system' });
   } catch (error) {
     if (error.name === 'TokenExpiredError') {
       throw new AppError(
@@ -437,12 +420,7 @@ export const resetPassword = asyncHandler(async (req, res) => {
 });
 
 /**
- * توليد توكن إعادة تعيين آمن (يُستخدم من داخل النظام عند الحاجة).
- * ملاحظة: حالياً نستخدم jwt.sign مباشرة في forgotPassword، لكن نُبقي
- * الدالة للاستخدام الداخلي (مثل Seed أو scripts لاحقة).
- *
- * @param {string} userId
- * @returns {string}
+ * توليد توكن إعادة تعيين آمن (داخلي).
  */
 export const generateResetToken = (userId) =>
   jwt.sign(
@@ -452,9 +430,7 @@ export const generateResetToken = (userId) =>
   );
 
 /**
- * توليد نص عشوائي آمن (للتوكنات المستقبلية).
- * @param {number} [bytes=32]
- * @returns {string}
+ * توليد نص عشوائي آمن.
  */
 export const generateSecureToken = (bytes = 32) =>
   crypto.randomBytes(bytes).toString('hex');

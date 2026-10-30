@@ -1,7 +1,8 @@
 /**
  * @file server.js
  * @description
- * نقطة دخول التطبيق (Backend) — Phase 4 (Reports).
+ * نقطة دخول التطبيق (Backend) — Phase 5
+ * (Reports فقط — Dashboard/Notifications/Backup مؤجلة حتى التحقق من الوحدات)
  */
 
 import express from 'express';
@@ -56,6 +57,13 @@ import customerReportRoutes from './routes/customerReportRoutes.js';
 import supplierReportRoutes from './routes/supplierReportRoutes.js';
 import inventoryReportRoutes from './routes/inventoryReportRoutes.js';
 
+import dashboardRoutes from './routes/dashboardRoutes.js';
+import notificationRoutes from './routes/notificationRoutes.js';
+import backupRoutes from './routes/backupRoutes.js';
+
+// ─── Routes — Settings (Phase D) ───
+import settingsRoutes from './routes/settingsRoutes.js';
+
 const app = express();
 
 /* ═════════════════════════════════════════════════════════════
@@ -70,8 +78,9 @@ app.use(
   })
 );
 
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+// ✅ A6: 50mb لدعم استعادة Backup مستقبلاً
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 app.use(cookieParser());
 app.use(compression());
 
@@ -90,8 +99,8 @@ app.get('/api/health', (req, res) => {
     message: 'Pharma System API is running',
     timestamp: new Date().toISOString(),
     environment: env.NODE_ENV,
-    version: '4.0.0',
-    phase: 'Phase 4 — Reports (18 reports)',
+    version: '5.0.0',
+    phase: 'Phase 5 — Reports (Dashboard/Notifications/Backup pending)',
   });
 });
 
@@ -137,7 +146,10 @@ app.use('/api/reports/sales', salesReportRoutes);
 app.use('/api/reports/customers', customerReportRoutes);
 app.use('/api/reports/suppliers', supplierReportRoutes);
 app.use('/api/reports/inventory', inventoryReportRoutes);
-
+app.use('/api/dashboard', dashboardRoutes)
+app.use('/api/notifications', notificationRoutes);
+app.use('/api/backup', backupRoutes);
+app.use('/api/settings', settingsRoutes);
 /* ═════════════════════════════════════════════════════════════
  * 8) 404 + Error handlers
  * ═════════════════════════════════════════════════════════════ */
@@ -158,7 +170,7 @@ const startServer = async () => {
       logger.info(`🚀 Server running on http://localhost:${PORT}`);
       logger.info(`   Environment: ${env.NODE_ENV}`);
       logger.info(`   Frontend URL: ${env.FRONTEND_URL}`);
-      logger.info(`   Phase: 4 (Reports) — 18 reports available`);
+      logger.info(`   Phase: 5 — Reports (Dashboard/Notifications/Backup pending)`);
     });
 
     if (env.NODE_ENV !== 'test') {

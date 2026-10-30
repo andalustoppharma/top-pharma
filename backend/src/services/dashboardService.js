@@ -12,7 +12,7 @@
  * ⚠️ ملاحظات معمارية:
  * - لا يعتمد على AccountingEntry (لتقارير الميزان لاحقاً).
  * - يستخدم currentBalance في CashFund/BankAccount (الحقل الفعلي).
- * - يستخدم isCancelled في CashTransaction.
+ * - يستخدم isReversed في CashTransaction (وليس isCancelled).
  * - يستخدم 'collected' في Check (وليس 'paid').
  */
 
@@ -23,7 +23,7 @@ import { Check, CHECK_STATUSES } from '../models/Check.js';
 import { Stock } from '../models/Stock.js';
 import { CashFund } from '../models/CashFund.js';
 import { BankAccount } from '../models/BankAccount.js';
-import { CashTransaction, CASH_DIRECTIONS, CASH_CATEGORIES } from '../models/CashTransaction.js';
+import { CashTransaction, CASH_DIRECTIONS } from '../models/CashTransaction.js';
 
 import { AppError } from '../middlewares/errorMiddleware.js';
 import { logger } from '../utils/logger.js';
@@ -319,10 +319,10 @@ async function computeFinancialSnapshot() {
 // ============================================================
 
 async function computeCashFlow(from, to) {
-  const [result] = await CashTransaction.aggregate([
+  const results = await CashTransaction.aggregate([      // ← بدون [ ]
     {
       $match: {
-        isCancelled: false,
+        isReversed: { $ne: true },
         transactionDate: { $gte: from, $lte: to },
       },
     },
@@ -335,7 +335,8 @@ async function computeCashFlow(from, to) {
     },
   ]);
 
-  const byDir = result.reduce((acc, r) => {
+  // ✅ نتائج aggregate مصفوفة دائماً — حتى لو فارغة
+  const byDir = results.reduce((acc, r) => {
     acc[r._id] = { total: round2(r.total), count: r.count };
     return acc;
   }, {});
@@ -516,6 +517,8 @@ async function getMiniUpcomingChecks(limit, days = 30) {
     status: CHECK_STATUSES.PENDING,
     dueDate: { $gte: now, $lte: end },
   })
+    .populate('customerId', 'name')
+    .populate('supplierId', 'name')
     .sort({ dueDate: 1 })
     .limit(limit)
     .lean();
@@ -525,7 +528,8 @@ async function getMiniUpcomingChecks(limit, days = 30) {
     checkNumber: c.checkNumber,
     type: c.type,
     bankName: c.bankName,
-    drawerName: c.drawerName,
+    drawerName: c.customerId?.name || c.supplierId?.name || '',
+ 
     amount: round2(c.amount),
     dueDate: c.dueDate,
     daysUntilDue: Math.ceil(

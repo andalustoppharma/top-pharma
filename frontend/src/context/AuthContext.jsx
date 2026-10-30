@@ -2,12 +2,8 @@
  * @file AuthContext.jsx
  * @description Context API لحالة المصادقة
  *
- * ✅ الحلول المُطبَّقة:
- * 1. قراءة متزامنة من localStorage عند التحميل (لا شاشة فارغة)
- * 2. عدم مسح الجلسة عند أخطاء الشبكة (فقط عند 401)
- * 3. دعم بنية name/role كـ strings
- * 4. تحديث البيانات في الخلفية (بلا حجب)
- * 5. خروج تلقائي بعد خمول 30 دقيقة
+ * ⚠️ B2 (Phase B): يُضيف permissions + hasPermission
+ *    لدعم RBAC على مستوى الواجهة بدون hardcoded roles.
  */
 
 import { createContext, useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -19,30 +15,14 @@ import {
 } from '../api/authAPI.js';
 import { ROLE_LABELS_AR, STORAGE_KEYS } from '../utils/constants.js';
 
-// ═══════════════════════════════════════════════
-// 1. إنشاء Context
-// ═══════════════════════════════════════════════
 export const AuthContext = createContext(null);
 
-// ═══════════════════════════════════════════════
-// 2. دوال مساعدة (Synchronous)
-// ═══════════════════════════════════════════════
-
-/**
- * قراءة المستخدم من localStorage بشكل آمن
- * @returns {Object|null}
- */
 function readUserFromStorage() {
   try {
     const raw = localStorage.getItem(STORAGE_KEYS.USER);
-    if (!raw) {
-      return null;
-    }
+    if (!raw) return null;
     const parsed = JSON.parse(raw);
-    // ✅ التحقق من صحة البيانات
-    if (parsed && parsed.email) {
-      return parsed;
-    }
+    if (parsed && parsed.email) return parsed;
     return null;
   } catch (e) {
     console.warn('فشل قراءة المستخدم من localStorage:', e);
@@ -50,10 +30,6 @@ function readUserFromStorage() {
   }
 }
 
-/**
- * قراءة توكن الوصول من localStorage
- * @returns {string|null}
- */
 function readTokenFromStorage() {
   try {
     return localStorage.getItem(STORAGE_KEYS.ACCESS_TOKEN);
@@ -62,17 +38,10 @@ function readTokenFromStorage() {
   }
 }
 
-// ═══════════════════════════════════════════════
-// 3. الإعدادات
-// ═══════════════════════════════════════════════
 const IDLE_TIMEOUT_MINUTES = Number(import.meta.env.VITE_SESSION_IDLE_TIMEOUT) || 30;
 const IDLE_TIMEOUT_MS = IDLE_TIMEOUT_MINUTES * 60 * 1000;
 
-// ═══════════════════════════════════════════════
-// 4. Provider
-// ═══════════════════════════════════════════════
 export function AuthProvider({ children }) {
-  // ✅ قراءة متزامنة (Lazy Initializer) — تعمل مرة واحدة عند التحميل
   const [user, setUser] = useState(() => readUserFromStorage());
   const [isAuthenticated, setIsAuthenticated] = useState(() => {
     const token = readTokenFromStorage();
@@ -84,9 +53,6 @@ export function AuthProvider({ children }) {
 
   const idleTimerRef = useRef(null);
 
-  // ═══════════════════════════════════════════════
-  // 5. مؤقت الخمول
-  // ═══════════════════════════════════════════════
   const clearIdleTimer = useCallback(() => {
     if (idleTimerRef.current) {
       clearTimeout(idleTimerRef.current);
@@ -96,13 +62,9 @@ export function AuthProvider({ children }) {
 
   const resetIdleTimer = useCallback(() => {
     clearIdleTimer();
-
-    if (!isAuthenticated) {
-      return;
-    }
+    if (!isAuthenticated) return;
 
     idleTimerRef.current = setTimeout(() => {
-      // ✅ نخرج المستخدم
       try {
         logoutAPI();
       } catch {
@@ -116,14 +78,10 @@ export function AuthProvider({ children }) {
     }, IDLE_TIMEOUT_MS);
   }, [isAuthenticated, clearIdleTimer]);
 
-  // ═══════════════════════════════════════════════
-  // 6. دوال الجلسة
-  // ═══════════════════════════════════════════════
   const persistSession = useCallback((userData, accessToken, refreshToken) => {
     localStorage.setItem(STORAGE_KEYS.ACCESS_TOKEN, accessToken);
     localStorage.setItem(STORAGE_KEYS.REFRESH_TOKEN, refreshToken);
     localStorage.setItem(STORAGE_KEYS.USER, JSON.stringify(userData));
-
     setUser(userData);
     setIsAuthenticated(true);
   }, []);
@@ -132,21 +90,16 @@ export function AuthProvider({ children }) {
     localStorage.removeItem(STORAGE_KEYS.ACCESS_TOKEN);
     localStorage.removeItem(STORAGE_KEYS.REFRESH_TOKEN);
     localStorage.removeItem(STORAGE_KEYS.USER);
-
     setUser(null);
     setIsAuthenticated(false);
     setError(null);
     clearIdleTimer();
   }, [clearIdleTimer]);
 
-  // ═══════════════════════════════════════════════
-  // 7. تسجيل الدخول
-  // ═══════════════════════════════════════════════
   const login = useCallback(
     async (email, password) => {
       setLoading(true);
       setError(null);
-
       try {
         const data = await loginAPI({ email, password });
         persistSession(data.user, data.accessToken, data.refreshToken);
@@ -162,43 +115,32 @@ export function AuthProvider({ children }) {
     [persistSession]
   );
 
-  // ═══════════════════════════════════════════════
-  // 8. تسجيل الخروج
-  // ═══════════════════════════════════════════════
   const logout = useCallback(async () => {
     try {
       await logoutAPI();
     } catch {
-      // ⚠️ نتجاهل الخطأ
+      // نتجاهل
     } finally {
       clearSession();
     }
   }, [clearSession]);
 
-  // ═══════════════════════════════════════════════
-  // 9. تحديث بيانات المستخدم (في الخلفية)
-  // ═══════════════════════════════════════════════
   const refreshUserData = useCallback(async () => {
     const token = readTokenFromStorage();
 
     if (!token) {
-      // ✅ لا يوجد توكن → امسح أي بيانات متبقية
       clearSession();
       return;
     }
 
     try {
       const userData = await getCurrentUser();
-
       if (userData && userData.email) {
-        // ✅ تحديث البيانات
         setUser(userData);
         setIsAuthenticated(true);
         localStorage.setItem(STORAGE_KEYS.USER, JSON.stringify(userData));
       }
     } catch (err) {
-      // ⚠️ مهم: لا نمسح الجلسة عند أخطاء الشبكة
-      // فقط عند 401 (توكن غير صالح)
       const errorCode = err?.error?.code || err?.code;
       const status = err?.status || err?.response?.status;
 
@@ -210,32 +152,21 @@ export function AuthProvider({ children }) {
       ) {
         clearSession();
       }
-      // وإلا → نُبقي المستخدم مسجّلاً بالبيانات المخزّنة
     }
   }, [clearSession]);
 
-  // ═══════════════════════════════════════════════
-  // 10. Effects
-  // ═══════════════════════════════════════════════
-
-  // ✅ عند التحميل: تحديث البيانات في الخلفية (بلا حجب)
   useEffect(() => {
     const timer = setTimeout(() => {
       refreshUserData();
     }, 100);
-
     return () => clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ✅ مراقبة النشاط (للخروج التلقائي)
   useEffect(() => {
-    if (!isAuthenticated) {
-      return;
-    }
+    if (!isAuthenticated) return;
 
     const events = ['mousemove', 'keydown', 'click', 'scroll', 'touchstart'];
-
     const handleActivity = () => {
       resetIdleTimer();
     };
@@ -254,18 +185,28 @@ export function AuthProvider({ children }) {
     };
   }, [isAuthenticated, resetIdleTimer, clearIdleTimer]);
 
-  // ═══════════════════════════════════════════════
-  // 11. القيمة المُصدَّرة
-  // ═══════════════════════════════════════════════
   const value = useMemo(() => {
-    // ✅ التعامل مع بنية name/role كـ strings
     const userName =
       typeof user?.name === 'string' ? user.name : user?.name?.ar || null;
-
     const userRole =
       typeof user?.role === 'string' ? user.role : user?.role?.name || null;
-
     const userRoleAr = ROLE_LABELS_AR[userRole] || userRole;
+
+    // ⚠️ B2: استخراج الصلاحيات
+    const permissions = Array.isArray(user?.permissions) ? user.permissions : [];
+    const isAdminRole = userRole === 'admin';
+
+    /**
+     * فحص الصلاحية (Fail-safe: أي خطأ → false إلا admin).
+     * @param {string} perm
+     * @returns {boolean}
+     */
+    const hasPermission = (perm) => {
+      if (!perm) return false;
+      if (isAdminRole) return true;
+      if (permissions.includes('*')) return true;
+      return permissions.includes(perm);
+    };
 
     return {
       // ✅ الحالة
@@ -284,9 +225,13 @@ export function AuthProvider({ children }) {
       userRole,
       userRoleAr,
 
-      // ✅ مساعدات
+      // ⚠️ B2: الصلاحيات
+      permissions,
+      hasPermission,
+
+      // ✅ مساعدات (backward-compatible)
       hasRole: (roleName) => userRole === roleName,
-      isAdmin: userRole === 'admin',
+      isAdmin: isAdminRole,
       isStorekeeper: userRole === 'storekeeper',
       isAccountant: userRole === 'accountant',
       isSalesRep: userRole === 'sales_rep',

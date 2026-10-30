@@ -1,7 +1,10 @@
 /**
  * @file AppRoutes.jsx
  * @description
- * تعريف مسارات التطبيق — Phase 4 (التقارير الكاملة).
+ * تعريف مسارات التطبيق — Phase 4 + Phase 5.
+ *
+ * ⚠️ كل المسارات المحمية (بما فيها /notifications و /backup)
+ *    يجب أن تكون داخل <Route element={<Layout />}>.
  */
 
 import { lazy, Suspense } from 'react';
@@ -10,9 +13,10 @@ import { Navigate, Route, Routes } from 'react-router-dom';
 import Layout from '../components/Layout/Layout.jsx';
 import Loading from '../components/UI/Loading.jsx';
 import ProtectedRoute, { PublicRoute } from './ProtectedRoute.jsx';
+import { useAuth } from '../hooks/useAuth.js';
 
 // ═══════════════════════════════════════════════════════════
-// 1. Lazy — Phase 0 (Auth)
+// 1. Phase 0 — Auth
 // ═══════════════════════════════════════════════════════════
 const Login = lazy(() => import('../pages/Login.jsx'));
 const ForgotPassword = lazy(() => import('../pages/ForgotPassword.jsx'));
@@ -68,7 +72,27 @@ const SupplierReportsPage = lazy(() => import('../pages/SupplierReportsPage.jsx'
 const InventoryReportsPage = lazy(() => import('../pages/InventoryReportsPage.jsx'));
 
 // ═══════════════════════════════════════════════════════════
-// 7. Suspense Fallback
+// 7. Phase 5 — Notifications + Backup
+// ═══════════════════════════════════════════════════════════
+const NotificationsPage = lazy(() => import('../pages/NotificationsPage.jsx'));
+const BackupPage = lazy(() => import('../pages/BackupPage.jsx'));
+// ═══════════════════════════════════════════════════════════
+// 8. Phase C — Users Management
+// ═══════════════════════════════════════════════════════════
+const UsersPage = lazy(() => import('../pages/UsersPage.jsx'));
+
+// ═══════════════════════════════════════════════════════════
+// 9. Phase C — Change Password (forced)
+// ═══════════════════════════════════════════════════════════
+const ChangePasswordPage = lazy(() => import('../pages/ChangePasswordPage.jsx'));
+
+// ═══════════════════════════════════════════════════════════
+// 10. Phase D — Settings
+// ═══════════════════════════════════════════════════════════
+const SettingsPage = lazy(() => import('../pages/SettingsPage.jsx'));
+
+// ═══════════════════════════════════════════════════════════
+// 8. Suspense Fallback
 // ═══════════════════════════════════════════════════════════
 const SuspenseFallback = () => (
   <div className="flex items-center justify-center min-h-screen bg-neutral-50">
@@ -77,50 +101,56 @@ const SuspenseFallback = () => (
 );
 
 // ═══════════════════════════════════════════════════════════
-// 8. AppRoutes
+// 8.5. HomeRedirect — الصفحة الرئيسية حسب الصلاحيات
+// ═══════════════════════════════════════════════════════════
+/**
+ * الصفحة الرئيسية للمستخدم حسب صلاحياته.
+ *
+ * ⚠️ BUG #1 Fix: بدل إظهار Dashboard للجميع (يفشل بـ 403 للأدوار
+ * التي لا تملك reports.view)، نوجّه كل مستخدم لأول صفحة مسموحة له.
+ *
+ * - من يملك reports.view (admin, accountant) → Dashboard
+ * - من يملك stocks.view (storekeeper) → /inventory/stock
+ * - من يملك invoices.view (sales_rep, pharmacy) → /sales/invoices
+ * - غير ذلك → /not-found (fail-safe)
+ */
+function HomeRedirect() {
+  const { hasPermission } = useAuth();
+
+  if (hasPermission('reports.view')) return <Dashboard />;
+  if (hasPermission('stocks.view')) return <Navigate to="/inventory/stock" replace />;
+  if (hasPermission('invoices.view')) return <Navigate to="/sales/invoices" replace />;
+  return <Navigate to="/not-found" replace />;
+}
+
+// ═══════════════════════════════════════════════════════════
+// 9. AppRoutes
 // ═══════════════════════════════════════════════════════════
 function AppRoutes() {
   return (
     <Suspense fallback={<SuspenseFallback />}>
       <Routes>
         {/* ─── Public ─── */}
-        <Route
-          path="/login"
-          element={
-            <PublicRoute>
-              <Login />
-            </PublicRoute>
-          }
-        />
-        <Route
-          path="/forgot-password"
-          element={
-            <PublicRoute>
-              <ForgotPassword />
-            </PublicRoute>
-          }
-        />
-        <Route
-          path="/reset-password/:token"
-          element={
-            <PublicRoute>
-              <ResetPassword />
-            </PublicRoute>
-          }
-        />
+        <Route path="/login" element={<PublicRoute><Login /></PublicRoute>} />
+        <Route path="/forgot-password" element={<PublicRoute><ForgotPassword /></PublicRoute>} />
+        <Route path="/reset-password/:token" element={<PublicRoute><ResetPassword /></PublicRoute>} />
 
-        {/* ─── Protected + Layout ─── */}
+        {/* ─── Phase C: Change Password (forced — بلا Layout) ─── */}
         <Route
-          path="/"
+          path="/change-password"
           element={
             <ProtectedRoute>
-              <Layout />
+              <ChangePasswordPage />
             </ProtectedRoute>
           }
-        >
-          {/* Dashboard */}
-          <Route index element={<Dashboard />} />
+        />
 
+        {/* ─── Protected + Layout ───
+            كل ما بداخله يرث Sidebar + Header + ToastContainer */}
+        <Route path="/" element={<ProtectedRoute><Layout /></ProtectedRoute>}>
+
+          {/* ⚠️ BUG #1 Fix: HomeRedirect بدل Dashboard مباشرة */}
+          <Route index element={<HomeRedirect />} />
           {/* Phase 1 — Inventory */}
           <Route path="inventory" element={<Inventory />} />
           <Route path="inventory/categories" element={<Categories />} />
@@ -148,13 +178,29 @@ function AppRoutes() {
           <Route path="finance/cash-transactions" element={<CashTransactionsPage />} />
           <Route path="finance/accounting-entries" element={<AccountingEntriesPage />} />
 
-          {/* Phase 4 — Reports (6 routes) */}
+          {/* Phase 4 — Reports */}
           <Route path="reports" element={<ReportsPage />} />
           <Route path="reports/finance" element={<FinanceReportsPage />} />
           <Route path="reports/sales" element={<SalesReportsPage />} />
           <Route path="reports/customers" element={<CustomerReportsPage />} />
           <Route path="reports/suppliers" element={<SupplierReportsPage />} />
           <Route path="reports/inventory" element={<InventoryReportsPage />} />
+
+          {/* Phase 5 — Notifications + Backup */}
+          <Route path="notifications" element={<NotificationsPage />} />
+          <Route path="backup" element={<BackupPage />} />
+
+          {/* Phase C — Users Management */}
+          <Route
+            path="users"
+            element={
+              <ProtectedRoute requiredPermissions={['users.view']}>
+                <UsersPage />
+              </ProtectedRoute>
+            }
+          />
+          {/* Phase D — Settings */}
+          <Route path="settings" element={<SettingsPage />} />
         </Route>
 
         {/* 404 */}

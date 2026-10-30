@@ -2,26 +2,20 @@
  * @file seed.js
  * @description
  * سكربت التهيئة الأساسي — Phase 2.5.
- *
- * ⚠️ إضافة Phase 2.5:
- * - Settings: سياسات التسعير الافتراضية (10% margin، 15% discount، إلخ).
- * - Roles: صلاحية `invoices.override_price_limit` للمحاسب.
  */
-
-import mongoose from 'mongoose';
 
 import { connectDatabase, disconnectDatabase } from '../config/database.js';
 import { logger } from '../utils/logger.js';
 
 import { User, USER_ROLES } from '../models/User.js';
-import { Role, SYSTEM_ROLES } from '../models/Role.js';
+import { Role, DEFAULT_ROLES } from '../models/Role.js';
 import { Category, SYSTEM_CATEGORIES } from '../models/Category.js';
 import { Warehouse, WAREHOUSE_TYPES } from '../models/Warehouse.js';
 import { Settings } from '../models/Settings.js';
 import { hashPassword } from '../utils/password.js';
 
 // ============================================================
-// Main
+// 1) الأدوار
 // ============================================================
 
 async function seedRoles() {
@@ -29,23 +23,27 @@ async function seedRoles() {
   let created = 0;
   let updated = 0;
 
-  for (const roleData of Object.values(SYSTEM_ROLES)) {
-    const existing = await Role.findOne({ name: roleData.name });
+  for (const roleData of DEFAULT_ROLES) {
+    const existing = await Role.findOne({ code: roleData.code });
     if (existing) {
+      existing.name = roleData.name;
       existing.permissions = roleData.permissions;
-      existing.label = roleData.label;
       existing.description = roleData.description;
       existing.isSystem = true;
       await existing.save();
       updated++;
     } else {
-      await Role.create({ ...roleData, isSystem: true, isActive: true });
+      await Role.create(roleData);
       created++;
     }
   }
 
   logger.info(`   ✅ ${created} جديد، ${updated} مُحدَّث.`);
 }
+
+// ============================================================
+// 2) Admin
+// ============================================================
 
 async function seedAdmin() {
   logger.info('👤 تهيئة حساب المدير...');
@@ -72,28 +70,46 @@ async function seedAdmin() {
   logger.info(`   ✅ تم إنشاء admin / ${rawPassword}`);
 }
 
+// ============================================================
+// 3) التصنيفات
+// ============================================================
+
 async function seedCategories() {
   logger.info('📁 تهيئة التصنيفات النظامية...');
 
-  const ops = SYSTEM_CATEGORIES.map((cat, idx) =>
-    Category.updateOne(
+  for (let idx = 0; idx < SYSTEM_CATEGORIES.length; idx++) {
+    const cat = SYSTEM_CATEGORIES[idx];
+    await Category.updateOne(
       { name: cat.name },
       {
-        $setOnInsert: { name: cat.name, isSystem: true, isActive: true },
-        $set: { label: cat.label, description: cat.description },
-        $setOnInsert2: { order: idx },
+        $setOnInsert: {
+          name: cat.name,
+          isSystem: true,
+          isActive: true,
+        },
+        $set: {
+          label: cat.label,
+          description: cat.description,
+        },
       },
       { upsert: true }
-    )
-  );
-  await Promise.all(ops);
+    );
+  }
+
   logger.info(`   ✅ ${SYSTEM_CATEGORIES.length} تصنيف نظامي.`);
 }
+
+// ============================================================
+// 4) المخزن الرئيسي
+// ============================================================
 
 async function seedWarehouse() {
   logger.info('🏪 تهيئة المخزن الرئيسي...');
 
-  const existing = await Warehouse.findOne({ type: WAREHOUSE_TYPES.MAIN, isActive: true });
+  const existing = await Warehouse.findOne({
+    type: WAREHOUSE_TYPES.MAIN,
+    isActive: true,
+  });
   if (existing) {
     logger.info('   ℹ️  المخزن الرئيسي موجود بالفعل.');
     return;
@@ -113,12 +129,15 @@ async function seedWarehouse() {
   logger.info('   ✅ تم إنشاء المخزن الرئيسي WH-MAIN.');
 }
 
+// ============================================================
+// 5) الإعدادات
+// ============================================================
+
 async function seedSettings() {
   logger.info('⚙️  تهيئة الإعدادات...');
 
   const existing = await Settings.findOne({ key: 'system' });
   if (existing) {
-    // ✅ Phase 2.5: نُحدّث فقط الحقول الجديدة (إن كانت مفقودة)
     let updated = false;
 
     if (existing.sales.minMarginPercent === undefined) {
@@ -151,7 +170,6 @@ async function seedSettings() {
     return;
   }
 
-  // إنشاء جديد
   await Settings.create({
     key: 'system',
     company: {
@@ -186,7 +204,6 @@ async function seedSettings() {
       returnGracePeriodDays: 7,
       defaultPaymentTerms: 30,
       allowNegativeStock: false,
-      // ✅ Phase 2.5
       minMarginPercent: 10,
       maxDiscountPercent: 15,
       allowPriceOverrides: true,
@@ -249,15 +266,7 @@ async function main() {
     logger.info('   البريد: admin@pharma-system.local');
     logger.info('   كلمة المرور: Admin@123456');
     logger.info('');
-    logger.info('⚙️  سياسات التسعير:');
-    logger.info('   minMarginPercent = 10%');
-    logger.info('   maxDiscountPercent = 15%');
-    logger.info('   allowPriceOverrides = true');
-    logger.info('   nearExpiryThresholdDays = 30');
-    logger.info('   nearExpiryMaxDiscountPercent = 30%');
-    logger.info('');
     logger.info('📌 التالي: npm run seed:test (للمستخدمين)');
-    logger.info('         npm run seed:invoices (لبيانات تجريبية)');
     logger.info('');
   } catch (error) {
     logger.error(`❌ فشل Seed: ${error.message}`);
